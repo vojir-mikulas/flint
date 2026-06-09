@@ -9,7 +9,7 @@
 
 use std::ops::Range;
 
-use crate::editor::TokenStyle;
+use flint::TokenStyle;
 
 const KEYWORDS: &[&str] = &[
     "select",

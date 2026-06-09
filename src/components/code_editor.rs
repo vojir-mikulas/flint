@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! **M0 spike B — a multiline code editor surface with syntax highlighting.**
+//! `CodeEditor` — a multiline code-editing surface with syntax highlighting.
 //!
-//! Flint only has a single-line `TextInput`, and zed's `Editor` isn't in the
-//! pinned slim `gpui`, so a multiline surface is genuinely net-new and must be
-//! built the same custom-`Element` way `TextInput` is. This spike proves the
-//! shape: N shaped lines, a line-number gutter, multi-line caret / selection /
-//! navigation, mouse hit-testing, and *live* highlighting built straight into
-//! the `TextRun` colors (the GPUI-native equivalent of the mockup's
-//! transparent-textarea-over-highlighted-`pre` trick).
+//! Flint's `TextInput` is single-line and zed's `Editor` isn't in the pinned slim
+//! `gpui`, so a multiline surface is genuinely net-new and is built the same
+//! custom-`Element` way `TextInput` is: N shaped lines, a line-number gutter,
+//! multi-line caret / selection / navigation, mouse hit-testing, and *live*
+//! highlighting baked straight into each [`TextRun`]'s color.
 //!
-//! Generic on purpose: the editor takes a [`Highlighter`] callback and knows
-//! nothing about SQL — the [`crate::sql`] tokenizer (RED-domain) feeds it. That's
-//! the Flint/RED split the MVP calls for. Deferred to M4: soft-wrap, undo,
-//! autocomplete, `tree-sitter-sql`, horizontal scroll for long lines.
+//! Domain-free by design — it takes a generic [`Highlighter`] callback (the SQL
+//! tokenizer lives in RED) and an optional [`CompletionProvider`] seam (RED feeds
+//! candidates from its introspected schema). The editor knows nothing about SQL.
+//! Deferred: soft-wrap, undo, `tree-sitter`, horizontal scroll for long lines.
 
 use std::ops::Range;
 use std::rc::Rc;
 
-use flint::theme::ActiveTheme;
-use flint::Theme;
 use gpui::{
     actions, div, fill, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context,
     CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
@@ -28,6 +24,8 @@ use gpui::{
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::theme::{ActiveTheme, Theme};
 
 actions!(
     flint_code_editor,
@@ -50,6 +48,7 @@ actions!(
         Newline,
         InsertTab,
         Run,
+        Escape,
         Copy,
         Cut,
         Paste,
@@ -87,10 +86,24 @@ impl TokenStyle {
 /// text color.
 pub type Highlighter = Rc<dyn Fn(&str) -> Vec<(Range<usize>, TokenStyle)>>;
 
+/// The completion seam: given the full text and the cursor's byte offset, return
+/// candidate completions for the word ending at the cursor. The editor replaces
+/// that word with the accepted candidate. Domain-free — RED supplies schema +
+/// keyword candidates; the editor never knows what a "table" is.
+pub type CompletionProvider = Rc<dyn Fn(&str, usize) -> Vec<SharedString>>;
+
 /// Emitted so the owner reacts to ⌘↵ without the editor knowing what "run" means.
 #[derive(Clone, Copy, Debug)]
 pub enum CodeEditorEvent {
     Run,
+}
+
+/// An open completion popup: the word being completed starts at `start` (replaced
+/// on accept), the matching `candidates`, and which one is highlighted.
+struct Completion {
+    start: usize,
+    candidates: Vec<SharedString>,
+    selected: usize,
 }
 
 pub struct CodeEditor {
@@ -104,6 +117,8 @@ pub struct CodeEditor {
     /// Preserved column for vertical navigation, in bytes within a line.
     desired_col: Option<usize>,
     highlighter: Option<Highlighter>,
+    completion_provider: Option<CompletionProvider>,
+    completion: Option<Completion>,
     // Cached from the last paint, for hit-testing between paints.
     last_bounds: Option<Bounds<Pixels>>,
     last_lines: Vec<ShapedLine>,
@@ -122,6 +137,8 @@ impl CodeEditor {
             read_only: false,
             desired_col: None,
             highlighter: None,
+            completion_provider: None,
+            completion: None,
             last_bounds: None,
             last_lines: Vec::new(),
             last_line_height: px(0.),
@@ -142,8 +159,42 @@ impl CodeEditor {
         self
     }
 
+    /// Install the completion seam. Candidates for the word under the cursor are
+    /// recomputed as the user types; Tab / Enter accept the highlighted one.
+    pub fn completions(mut self, f: impl Fn(&str, usize) -> Vec<SharedString> + 'static) -> Self {
+        self.completion_provider = Some(Rc::new(f));
+        self
+    }
+
+    /// Replace the completion provider after construction — RED rebuilds it as the
+    /// schema loads, so candidates grow without recreating the editor.
+    pub fn set_completions(
+        &mut self,
+        f: impl Fn(&str, usize) -> Vec<SharedString> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.completion_provider = Some(Rc::new(f));
+        cx.notify();
+    }
+
     pub fn content(&self) -> String {
         self.content.clone()
+    }
+
+    /// The current selection's text, or `None` if the selection is empty.
+    pub fn selected_text(&self) -> Option<String> {
+        (!self.selected_range.is_empty())
+            .then(|| self.content[self.selected_range.clone()].to_string())
+    }
+
+    /// Replace the whole buffer (e.g. loading a query from history). Caret goes to
+    /// the end; any open completion is dismissed.
+    pub fn set_content(&mut self, content: impl Into<String>, cx: &mut Context<Self>) {
+        self.content = content.into();
+        let end = self.content.len();
+        self.selected_range = end..end;
+        self.completion = None;
+        cx.notify();
     }
 
     pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
@@ -171,6 +222,7 @@ impl CodeEditor {
             KeyBinding::new("shift-end", SelectEnd, ctx),
             KeyBinding::new("enter", Newline, ctx),
             KeyBinding::new("tab", InsertTab, ctx),
+            KeyBinding::new("escape", Escape, ctx),
         ]);
         #[cfg(target_os = "macos")]
         cx.bind_keys([
@@ -229,6 +281,7 @@ impl CodeEditor {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.completion = None;
         cx.notify();
     }
 
@@ -269,6 +322,72 @@ impl CodeEditor {
         self.desired_col = Some(want);
     }
 
+    // --- completion seam ---
+
+    /// Byte offset where the identifier ending at the cursor begins, or `None`
+    /// when the cursor isn't right after an identifier character.
+    fn current_word_start(&self) -> Option<usize> {
+        let cursor = self.cursor_offset();
+        let bytes = self.content.as_bytes();
+        let mut start = cursor;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        (start < cursor).then_some(start)
+    }
+
+    /// Recompute the completion popup against the provider. Called after edits.
+    fn refresh_completions(&mut self) {
+        self.completion = None;
+        let Some(provider) = self.completion_provider.clone() else {
+            return;
+        };
+        if !self.selected_range.is_empty() {
+            return;
+        }
+        let Some(start) = self.current_word_start() else {
+            return;
+        };
+        let candidates = provider(&self.content, self.cursor_offset());
+        if !candidates.is_empty() {
+            self.completion = Some(Completion {
+                start,
+                candidates,
+                selected: 0,
+            });
+        }
+    }
+
+    fn completion_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if let Some(c) = &mut self.completion {
+            let n = c.candidates.len() as isize;
+            c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
+            cx.notify();
+        }
+    }
+
+    /// Replace the in-progress word with the highlighted candidate.
+    fn accept_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Some(c) = self.completion.take() else {
+            return false;
+        };
+        let cursor = self.cursor_offset();
+        let candidate = c.candidates[c.selected].to_string();
+        self.content = self.content[..c.start].to_owned() + &candidate + &self.content[cursor..];
+        let caret = c.start + candidate.len();
+        self.selected_range = caret..caret;
+        cx.notify();
+        true
+    }
+
     // --- action handlers ---
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -296,9 +415,17 @@ impl CodeEditor {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion.is_some() {
+            self.completion_move(-1, cx);
+            return;
+        }
         self.vertical(true, false, cx);
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion.is_some() {
+            self.completion_move(1, cx);
+            return;
+        }
         self.vertical(false, false, cx);
     }
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -355,15 +482,27 @@ impl CodeEditor {
         self.replace_text_in_range(None, "", window, cx);
     }
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter accepts an open completion rather than inserting a line.
+        if self.accept_completion(cx) {
+            return;
+        }
         self.desired_col = None;
         self.replace_text_in_range(None, "\n", window, cx);
     }
     fn insert_tab(&mut self, _: &InsertTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.accept_completion(cx) {
+            return;
+        }
         self.desired_col = None;
         self.replace_text_in_range(None, "  ", window, cx);
     }
     fn run(&mut self, _: &Run, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(CodeEditorEvent::Run);
+    }
+    fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion.take().is_some() {
+            cx.notify();
+        }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
@@ -526,6 +665,7 @@ impl EntityInputHandler for CodeEditor {
         let caret = range.start + new_text.len();
         self.selected_range = caret..caret;
         self.marked_range = None;
+        self.refresh_completions();
         cx.notify();
     }
 
@@ -857,11 +997,37 @@ impl Render for CodeEditor {
 
         let focused = self.focus_handle.is_focused(window);
 
+        // Completion popup (the seam, exercised). Docked bottom-left so it needs
+        // no caret geometry; M-future may caret-anchor it.
+        let popup = self.completion.as_ref().map(|c| {
+            div()
+                .absolute()
+                .bottom_1()
+                .left(px(56.))
+                .max_w(px(280.))
+                .bg(theme.bg_elevated)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(theme.radius_sm)
+                .py_1()
+                .child(div().flex().flex_col().children(
+                    c.candidates.iter().take(8).enumerate().map(|(i, cand)| {
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .text_size(px(12.))
+                            .text_color(theme.text)
+                            .when(i == c.selected, |d| d.bg(theme.bg_selected))
+                            .child(cand.clone())
+                    }),
+                ))
+        });
+
         div()
+            .relative()
             .flex()
             .flex_col()
-            .h(px(280.))
-            .w_full()
+            .size_full()
             .bg(theme.bg_app)
             .border_1()
             .border_color(if focused { theme.accent } else { theme.border })
@@ -889,6 +1055,7 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::insert_tab))
             .on_action(cx.listener(Self::run))
+            .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
@@ -897,5 +1064,6 @@ impl Render for CodeEditor {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(scroll_area)
+            .children(popup)
     }
 }

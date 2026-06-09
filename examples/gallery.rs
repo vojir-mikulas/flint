@@ -23,13 +23,10 @@ use gpui_platform::application;
 // Spike modules live in `gallery/` so Cargo doesn't treat them as separate
 // example targets; `#[path]` is needed because this example root resolves
 // `mod` siblings in `examples/`, not `examples/gallery/`.
-#[path = "gallery/editor.rs"]
-mod editor;
 #[path = "gallery/sql.rs"]
 mod sql;
 #[path = "gallery/streaming.rs"]
 mod streaming;
-use editor::{CodeEditor, CodeEditorEvent};
 use streaming::{
     CellColors, RowSource, SlowShared, SqliteSource, SyntheticSource, WindowBuffer, SQLITE_ROWS,
 };

@@ -20,6 +20,9 @@ pub use gpui;
 
 pub use components::badge::{Badge, BadgeVariant};
 pub use components::button::{Button, ButtonSize, ButtonVariant};
+pub use components::code_editor::{
+    CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
+};
 pub use components::context_menu::{ContextMenu, ContextMenuItem};
 pub use components::icon_button::{IconButton, IconButtonSize};
 pub use components::modal::Modal;
@@ -41,6 +44,9 @@ pub use theme::{ActiveTheme, Theme};
 pub mod prelude {
     pub use crate::components::badge::{Badge, BadgeVariant};
     pub use crate::components::button::{Button, ButtonSize, ButtonVariant};
+    pub use crate::components::code_editor::{
+        CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
+    };
     pub use crate::components::context_menu::{ContextMenu, ContextMenuItem};
     pub use crate::components::icon_button::{IconButton, IconButtonSize};
     pub use crate::components::modal::Modal;
