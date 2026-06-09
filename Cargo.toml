@@ -41,9 +41,12 @@ unicode-segmentation = "1"
 gpui = { workspace = true, features = ["font-kit"] }
 
 # Dev-only: the gallery example needs `application()` to open a window. As a
-# dev-dependency, the *library* still depends on `gpui` alone.
+# dev-dependency, the *library* still depends on `gpui` alone. `rusqlite` backs
+# the streaming-grid spike (M0) with a real multi-million-row table; it is an
+# example-only dep, so the library stays domain- and SQLite-free.
 [dev-dependencies]
 gpui_platform.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui_platform = { workspace = true, features = ["font-kit"] }

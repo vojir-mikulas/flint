@@ -13,6 +13,7 @@ pub mod modal;
 pub mod progress_bar;
 pub mod segmented;
 pub mod select;
+pub mod split_pane;
 pub mod table;
 pub mod tabs;
 pub mod text_input;

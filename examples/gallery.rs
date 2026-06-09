@@ -6,12 +6,34 @@
 //! and renders every component in its key states. The header toggles One Dark ↔
 //! GitHub Dark so theming is verifiable at a glance.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use flint::prelude::*;
 use gpui::{
-    anchored, deferred, div, prelude::*, App, Bounds, Context, Entity, MouseButton, Pixels, Point,
-    SharedString, Window, WindowBounds, WindowOptions,
+    anchored, deferred, div, prelude::*, px, App, Axis, Bounds, Context, Entity, MouseButton,
+    Pixels, Point, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
+
+// Spike modules live in `gallery/` so Cargo doesn't treat them as separate
+// example targets; `#[path]` is needed because this example root resolves
+// `mod` siblings in `examples/`, not `examples/gallery/`.
+#[path = "gallery/editor.rs"]
+mod editor;
+#[path = "gallery/sql.rs"]
+mod sql;
+#[path = "gallery/streaming.rs"]
+mod streaming;
+use editor::{CodeEditor, CodeEditorEvent};
+use streaming::{
+    CellColors, RowSource, SlowShared, SqliteSource, SyntheticSource, WindowBuffer, SQLITE_ROWS,
+};
+
+const SAMPLE_SQL: &str = "-- M0 spike B: a multiline SQL editor surface\nSELECT u.id, u.email, count(o.id) AS orders\nFROM users u\nLEFT JOIN orders o ON o.user_id = u.id\nWHERE u.active = true AND u.score >= 42.0\nGROUP BY u.id, u.email\nHAVING count(o.id) > 0\nORDER BY orders DESC\nLIMIT 100;";
 
 /// Demo rows for the `Table` section: `(name, size, modified)`.
 const ROWS: &[(&str, &str, &str)] = &[
@@ -48,10 +70,46 @@ struct Gallery {
     row_menu: Option<(usize, Point<Pixels>)>,
     /// Backing list for the in-app drag-to-folder table demo.
     drag_items: Vec<DragItem>,
+
+    // --- M0 spike A: streaming grid ---
+    /// 0 = synthetic (10M), 1 = SQLite (2M).
+    stream_source_ix: usize,
+    stream_buffer: Rc<RefCell<WindowBuffer>>,
+    stream_scroll: UniformListScrollHandle,
+    synthetic: Rc<SyntheticSource>,
+    /// Built lazily once the background-generated DB is ready.
+    sqlite: Option<Rc<SqliteSource>>,
+    db_ready: Arc<AtomicBool>,
+    /// The long-query cancel demo's shared state.
+    slow: Arc<Mutex<SlowShared>>,
+
+    // --- M0 spike B: multiline SQL editor ---
+    sql_editor: Entity<CodeEditor>,
+    editor_readonly: bool,
+    /// A one-line summary of the last query "run" (⌘↵ or the Run button).
+    last_run: Option<SharedString>,
+
+    // --- SplitPane demo: caller-owned sizes + in-flight drag anchors ---
+    split_h_size: Pixels,
+    split_h_drag: Option<DragAnchor>,
+    split_v_size: Pixels,
+    split_v_drag: Option<DragAnchor>,
 }
 
 impl Gallery {
-    fn new(cx: &mut App) -> Self {
+    fn new(cx: &mut Context<Self>, db_ready: Arc<AtomicBool>) -> Self {
+        let sql_editor = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .with_content(SAMPLE_SQL)
+                .highlighter(sql::tokenize)
+        });
+        // ⌘↵ in the editor emits Run; mirror it into the "last run" readout.
+        cx.subscribe(&sql_editor, |this, editor, _event: &CodeEditorEvent, cx| {
+            let sql = editor.read(cx).content();
+            this.last_run = Some(summarize_sql(&sql));
+            cx.notify();
+        })
+        .detach();
         Self {
             name_input: cx.new(|cx| TextInput::new(cx).with_content("Production")),
             host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("sftp.example.com")),
@@ -92,6 +150,130 @@ impl Gallery {
                     parent: None,
                 },
             ],
+
+            stream_source_ix: 0,
+            stream_buffer: Rc::new(RefCell::new(WindowBuffer::default())),
+            stream_scroll: UniformListScrollHandle::new(),
+            synthetic: Rc::new(SyntheticSource::default()),
+            sqlite: None,
+            db_ready,
+            slow: Arc::new(Mutex::new(SlowShared::default())),
+
+            sql_editor,
+            editor_readonly: false,
+            last_run: None,
+
+            split_h_size: px(200.),
+            split_h_drag: None,
+            split_v_size: px(120.),
+            split_v_drag: None,
+        }
+    }
+
+    /// Nested resizable split: a sidebar (horizontal) wrapping a stacked
+    /// editor/results pair (vertical). Drag either divider to resize.
+    fn split_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg_left, bg_top, bg_bottom) = (theme.bg_panel_2, theme.bg_app, theme.bg_panel);
+        let (muted, border, radius) = (theme.text_muted, theme.border, theme.radius);
+        let view = cx.entity();
+
+        let pane = move |label: &'static str, bg| {
+            div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(bg)
+                .text_color(muted)
+                .text_sm()
+                .child(label)
+        };
+
+        let inner = SplitPane::new("gallery-split-v", Axis::Vertical)
+            .size(self.split_v_size)
+            .drag(self.split_v_drag)
+            .min_first(px(48.))
+            .on_drag_start({
+                let v = view.clone();
+                move |a, _, cx| {
+                    v.update(cx, |t, cx| {
+                        t.split_v_drag = Some(a);
+                        cx.notify();
+                    })
+                }
+            })
+            .on_resize({
+                let v = view.clone();
+                move |s, _, cx| {
+                    v.update(cx, |t, cx| {
+                        t.split_v_size = s;
+                        cx.notify();
+                    })
+                }
+            })
+            .on_drag_end({
+                let v = view.clone();
+                move |_, cx| {
+                    v.update(cx, |t, cx| {
+                        t.split_v_drag = None;
+                        cx.notify();
+                    })
+                }
+            })
+            .first(pane("Editor (top)", bg_top))
+            .second(pane("Results (bottom)", bg_bottom));
+
+        let outer = SplitPane::new("gallery-split-h", Axis::Horizontal)
+            .size(self.split_h_size)
+            .drag(self.split_h_drag)
+            .min_first(px(120.))
+            .max_first(px(420.))
+            .on_drag_start({
+                let v = view.clone();
+                move |a, _, cx| {
+                    v.update(cx, |t, cx| {
+                        t.split_h_drag = Some(a);
+                        cx.notify();
+                    })
+                }
+            })
+            .on_resize({
+                let v = view.clone();
+                move |s, _, cx| {
+                    v.update(cx, |t, cx| {
+                        t.split_h_size = s;
+                        cx.notify();
+                    })
+                }
+            })
+            .on_drag_end({
+                let v = view.clone();
+                move |_, cx| {
+                    v.update(cx, |t, cx| {
+                        t.split_h_drag = None;
+                        cx.notify();
+                    })
+                }
+            })
+            .first(pane("Schema (left)", bg_left))
+            .second(inner);
+
+        div()
+            .w_full()
+            .h(px(280.))
+            .rounded(radius)
+            .overflow_hidden()
+            .border_1()
+            .border_color(border)
+            .child(outer)
+    }
+
+    /// The active streaming source as a trait object (synthetic or SQLite).
+    fn stream_source(&self) -> Rc<dyn RowSource> {
+        match (self.stream_source_ix, self.sqlite.as_ref()) {
+            (1, Some(sqlite)) => sqlite.clone(),
+            _ => self.synthetic.clone(),
         }
     }
 
@@ -574,6 +756,258 @@ impl Gallery {
             )))
     }
 
+    /// **M0 spike A** — a streaming grid over a bounded window buffer, with a
+    /// live readout proving memory stays flat, plus an out-of-band cancel demo.
+    fn streaming_grid(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let source = self.stream_source();
+        let specs = source.columns().to_vec();
+        let total = source.total();
+        let radius = theme.radius;
+        let rownum_color = theme.text_faint;
+        let muted = theme.text_muted;
+        let colors = CellColors {
+            text: theme.text,
+            faint: theme.text_faint,
+            num: theme.orange,
+            json: theme.cyan,
+            bool_true: theme.green,
+            bool_false: theme.red,
+        };
+
+        // A row-number gutter column + one column per source column.
+        let mut columns = vec![Column::new("#").width(px(64.)).align_end()];
+        for spec in &specs {
+            let c = Column::new(spec.name.clone());
+            columns.push(if spec.numeric {
+                c.width(px(120.)).align_end()
+            } else {
+                c.flex()
+            });
+        }
+        let ncols = specs.len();
+
+        let buf_for_range = self.stream_buffer.clone();
+        let src_for_range = source.clone();
+        let buf_for_row = self.stream_buffer.clone();
+
+        let table = Table::<()>::new("stream-grid", columns)
+            .row_count(total)
+            .row_height(px(25.))
+            .track_scroll(&self.stream_scroll)
+            // Fill the window around the viewport *before* the rows render.
+            .on_visible_range(move |range, _window, _cx| {
+                buf_for_range.borrow_mut().ensure(&*src_for_range, range);
+            })
+            .render_row(move |ix, _window, _cx| {
+                let buf = buf_for_row.borrow();
+                let mut out: Vec<gpui::AnyElement> = Vec::with_capacity(ncols + 1);
+                out.push(
+                    div()
+                        .text_color(rownum_color)
+                        .child((ix + 1).to_string())
+                        .into_any_element(),
+                );
+                match buf.get(ix) {
+                    Some(cells) => {
+                        for cell in cells {
+                            let is_null = cell.kind == streaming::CellKind::Null;
+                            out.push(
+                                div()
+                                    .text_color(colors.for_kind(cell.kind))
+                                    .when(is_null, |d| d.italic())
+                                    .child(cell.text.clone())
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                    // Not yet loaded — a skeleton placeholder (M5 would shimmer).
+                    None => {
+                        for _ in 0..ncols {
+                            out.push(div().text_color(rownum_color).child("·").into_any_element());
+                        }
+                    }
+                }
+                out
+            });
+
+        // Live buffer stats (one frame behind: paint fills the buffer after this
+        // render builds the tree). Proves `buffered` plateaus while `total` is huge.
+        let readout = {
+            let b = self.stream_buffer.borrow();
+            let fetch = b
+                .last_fetch()
+                .map(|r| format!("{}..{}", r.start, r.end))
+                .unwrap_or_else(|| "—".into());
+            let w = b.window();
+            format!(
+                "buffered {} rows  ·  window {}..{}  ·  last fetch {}  ·  {} fetches  ·  {} rows read  ·  total {}",
+                b.buffered(),
+                w.start,
+                w.end,
+                fetch,
+                b.fetches(),
+                b.rows_read(),
+                total,
+            )
+        };
+
+        // Source switcher.
+        let view = cx.entity();
+        let segmented = Segmented::new("stream-src")
+            .segment("Synthetic · 10M")
+            .segment("SQLite · 2M")
+            .selected(self.stream_source_ix)
+            .on_select(move |ix, _window, cx| {
+                view.update(cx, |this, cx| {
+                    if this.stream_source_ix != ix {
+                        this.stream_source_ix = ix;
+                        this.stream_buffer.borrow_mut().clear();
+                    }
+                    cx.notify();
+                });
+            });
+
+        // Cancel demo.
+        let slow = self.slow.lock().unwrap();
+        let running = slow.status.is_running();
+        let status_label = slow.status.label();
+        drop(slow);
+        let sqlite_note = if self.stream_source_ix == 1 && self.sqlite.is_none() {
+            format!("preparing {SQLITE_ROWS}-row SQLite table in the background…")
+        } else {
+            String::new()
+        };
+
+        let cancel_row = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                Button::new("slow-run", "Run slow query")
+                    .variant(ButtonVariant::Secondary)
+                    .disabled(running)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        streaming::run_slow(this.slow.clone());
+                        let shared = this.slow.clone();
+                        let bg = cx.background_executor().clone();
+                        // Poll the worker's status and repaint until it settles.
+                        cx.spawn(async move |this, cx| loop {
+                            bg.timer(Duration::from_millis(100)).await;
+                            let running = shared.lock().unwrap().status.is_running();
+                            let _ = this.update(cx, |_, cx| cx.notify());
+                            if !running {
+                                break;
+                            }
+                        })
+                        .detach();
+                    })),
+            )
+            .child(
+                Button::new("slow-cancel", "Cancel")
+                    .variant(ButtonVariant::Danger)
+                    .disabled(!running)
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        streaming::cancel_slow(&this.slow);
+                        cx.notify();
+                    })),
+            )
+            .child(div().text_xs().text_color(muted).child(status_label));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w_full()
+            .child(segmented)
+            .child(
+                div()
+                    .h(px(360.))
+                    .w_full()
+                    .panel(cx)
+                    .rounded(radius)
+                    .overflow_hidden()
+                    .child(table),
+            )
+            .child(div().text_xs().text_color(rownum_color).child(readout))
+            .when(!sqlite_note.is_empty(), |this| {
+                this.child(div().text_xs().text_color(theme.yellow).child(sqlite_note))
+            })
+            .child(cancel_row)
+    }
+
+    /// **M0 spike B** — the multiline SQL editor with live highlighting, a
+    /// line-number gutter, a Run (⌘↵) affordance and a read-only toggle.
+    fn sql_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.text_muted;
+        let yellow = theme.yellow;
+        let radius_sm = theme.radius_sm;
+
+        // Editor bar: Run button, ⌘↵ hint, read-only toggle + chip, last run.
+        let toggle_view = cx.entity();
+        let read_only = self.editor_readonly;
+        let run_btn = Button::new("editor-run", "Run")
+            .variant(ButtonVariant::Primary)
+            .on_click(cx.listener(|this, _, _window, cx| {
+                let sql = this.sql_editor.read(cx).content();
+                this.last_run = Some(summarize_sql(&sql));
+                cx.notify();
+            }));
+
+        let mut bar = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .h(px(34.))
+            .px_3()
+            .panel(cx)
+            .child(run_btn)
+            .child(div().text_xs().text_color(muted).child("⌘↵"))
+            .child(
+                Toggle::new("editor-ro", read_only).on_change(move |on, _window, cx| {
+                    let on = *on;
+                    toggle_view.update(cx, |this, cx| {
+                        this.editor_readonly = on;
+                        this.sql_editor
+                            .update(cx, |ed, cx| ed.set_read_only(on, cx));
+                        cx.notify();
+                    });
+                }),
+            )
+            .child(div().text_xs().text_color(muted).child("read-only"));
+
+        if read_only {
+            bar = bar.child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(radius_sm)
+                    .bg(yellow.opacity(0.12))
+                    .text_xs()
+                    .text_color(yellow)
+                    .child("READ ONLY"),
+            );
+        }
+        if let Some(last) = self.last_run.as_ref() {
+            bar = bar.child(
+                div()
+                    .ml_auto()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("ran: {last}")),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_0()
+            .w_full()
+            .child(self.sql_editor.clone())
+            .child(bar)
+    }
+
     fn modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let close_view = cx.entity();
         let save_view = cx.entity();
@@ -616,6 +1050,18 @@ impl Gallery {
 
 impl Render for Gallery {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Lazily open the streaming SQLite source once the background generator
+        // has finished writing the temp DB.
+        if self.stream_source_ix == 1
+            && self.sqlite.is_none()
+            && self.db_ready.load(Ordering::SeqCst)
+        {
+            if let Ok(src) = SqliteSource::open(&streaming::db_path()) {
+                self.sqlite = Some(Rc::new(src));
+                self.stream_buffer.borrow_mut().clear();
+            }
+        }
+
         let theme_name = cx.theme().name.clone();
         let open_modal = cx.listener(|this, _, _, cx| {
             this.modal_open = true;
@@ -660,9 +1106,12 @@ impl Render for Gallery {
         let context_menu = self.context_menu();
         let toasts = self.toasts();
         let tooltip = self.tooltip_demo();
+        let split_pane = self.split_pane(cx);
         let table = self.table(cx);
         let secondary_table = self.secondary_table(cx);
         let drag_table = self.drag_table(cx);
+        let streaming_grid = self.streaming_grid(cx);
+        let sql_editor = self.sql_editor(cx);
 
         let body = div()
             .id("scroll")
@@ -693,9 +1142,20 @@ impl Render for Gallery {
                     cx,
                 ),
             )
+            .child(self.section("Split pane (nested, resizable)", split_pane, cx))
             .child(self.section("Table", table, cx))
             .child(self.section("Table - right-click menu", secondary_table, cx))
-            .child(self.section("Table - in-app drag to folder", drag_table, cx));
+            .child(self.section("Table - in-app drag to folder", drag_table, cx))
+            .child(self.section(
+                "M0 spike A - streaming grid (bounded window + cancel)",
+                streaming_grid,
+                cx,
+            ))
+            .child(self.section(
+                "M0 spike B - multiline SQL editor (syntax highlighting)",
+                sql_editor,
+                cx,
+            ));
 
         div()
             .size_full()
@@ -713,10 +1173,31 @@ impl Render for Gallery {
     }
 }
 
+/// First meaningful (non-comment) line of a query, truncated — the "last run".
+fn summarize_sql(sql: &str) -> SharedString {
+    let line = sql
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with("--"))
+        .unwrap_or("");
+    let truncated: String = line.chars().take(60).collect();
+    if line.chars().count() > 60 {
+        format!("{truncated}…").into()
+    } else {
+        truncated.into()
+    }
+}
+
 fn main() {
     application().run(|cx: &mut App| {
         cx.set_global(Theme::one_dark());
         TextInput::bind_keys(cx);
+        CodeEditor::bind_keys(cx);
+
+        // Kick off generation of the 2M-row SQLite table for spike A so it's
+        // ready by the time anyone switches the streaming grid to it.
+        let db_ready = Arc::new(AtomicBool::new(false));
+        streaming::spawn_generate(db_ready.clone());
 
         let bounds = Bounds::centered(None, gpui::size(gpui::px(960.0), gpui::px(720.0)), cx);
         cx.open_window(
@@ -724,7 +1205,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| Gallery::new(cx)),
+            |_, cx| cx.new(|cx| Gallery::new(cx, db_ready.clone())),
         )
         .expect("failed to open gallery window");
         cx.activate(true);

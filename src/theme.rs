@@ -58,6 +58,8 @@ pub struct Theme {
     pub yellow: Hsla,
     /// Orange (archives, secondary warning).
     pub orange: Hsla,
+    /// Cyan (JSON cells, SQL operators).
+    pub cyan: Hsla,
 
     /// File-row height.
     pub row_height: Pixels,

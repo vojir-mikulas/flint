@@ -5,6 +5,7 @@
 //! declares [`Column`]s + a row renderer and owns selection/sort, which the table
 //! renders and reports clicks against.
 
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
@@ -80,6 +81,11 @@ fn cell_layout<E: Styled>(el: E, column: &Column, align: ColumnAlign) -> E {
 }
 
 type IndexHandler = Box<dyn Fn(usize, &mut Window, &mut App) + 'static>;
+/// Reports the currently visible row range on every paint, *before* the rows in
+/// it are rendered. Lets a caller back the table with a windowed/streaming data
+/// source: prefetch the window around the viewport and evict everything else, so
+/// memory stays bounded no matter how many rows the source claims to have.
+type VisibleRangeHandler = Rc<dyn Fn(Range<usize>, &mut Window, &mut App) + 'static>;
 /// Row-click handler; also receives the click, for modifier-aware selection.
 type RowClickHandler = Box<dyn Fn(usize, &ClickEvent, &mut Window, &mut App) + 'static>;
 /// Receives the row index and cursor position, to anchor a context menu.
@@ -148,6 +154,7 @@ pub struct Table<D: 'static = ()> {
     highlighted_rows: Option<RowPredicate>,
     draggable_rows: Option<RowPredicate>,
     scroll_handle: Option<UniformListScrollHandle>,
+    on_visible_range: Option<VisibleRangeHandler>,
 }
 
 impl<D: 'static> Table<D> {
@@ -176,6 +183,7 @@ impl<D: 'static> Table<D> {
             highlighted_rows: None,
             draggable_rows: None,
             scroll_handle: None,
+            on_visible_range: None,
         }
     }
 
@@ -331,6 +339,20 @@ impl<D: 'static> Table<D> {
         self.render_row = Some(Rc::new(renderer));
         self
     }
+
+    /// Called once per paint with the row range `uniform_list` is about to
+    /// render, before [`render_row`](Self::render_row) runs for any row in it.
+    /// A caller backing the table with a windowed source uses this to prefetch
+    /// the visible window (and drop rows outside it) so [`render_row`](Self::render_row)
+    /// then hits an already-populated buffer. Stays domain-free: the table knows
+    /// nothing about where rows come from.
+    pub fn on_visible_range(
+        mut self,
+        handler: impl Fn(Range<usize>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_visible_range = Some(Rc::new(handler));
+        self
+    }
 }
 
 impl<D: 'static> RenderOnce for Table<D> {
@@ -416,6 +438,7 @@ impl<D: 'static> RenderOnce for Table<D> {
         let draggable_rows = self.draggable_rows.clone();
         let selected = self.selected;
         let selected_set = self.selected_set.clone();
+        let on_visible_range = self.on_visible_range.clone();
         let row_count = self.row_count;
 
         // Token snapshot so the `'static` row closure doesn't borrow `cx`.
@@ -425,6 +448,11 @@ impl<D: 'static> RenderOnce for Table<D> {
         let text = theme.text;
 
         let list = uniform_list("table-rows", row_count, move |range, window, cx| {
+            // Report the about-to-render window so a windowed source can fill the
+            // buffer (and evict outside it) before `render_row` reads it below.
+            if let Some(on_visible_range) = on_visible_range.as_ref() {
+                on_visible_range(range.clone(), window, cx);
+            }
             let mut rows = Vec::with_capacity(range.len());
             for ix in range {
                 let is_selected =

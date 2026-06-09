@@ -48,6 +48,7 @@ impl Theme {
             purple: h(0xc678dd),
             yellow: h(0xe5c07b),
             orange: h(0xd19a66),
+            cyan: h(0x56b6c2),
 
             row_height: px(26.0),
             radius: px(5.0),
@@ -90,6 +91,7 @@ impl Theme {
             purple: h(0xd2a8ff),
             yellow: h(0xe3b341),
             orange: h(0xffa657),
+            cyan: h(0x76e3ea),
 
             row_height: px(26.0),
             radius: px(5.0),
@@ -132,6 +134,7 @@ impl Theme {
             purple: h(0xd2a6ff),
             yellow: h(0xffd173),
             orange: h(0xff8f40),
+            cyan: h(0x73d0ff),
 
             row_height: px(26.0),
             radius: px(5.0),
@@ -174,6 +177,7 @@ impl Theme {
             purple: h(0xa37acc),
             yellow: h(0xf2ae49),
             orange: h(0xfa8d3e),
+            cyan: h(0x4cbf99),
 
             row_height: px(26.0),
             radius: px(5.0),
