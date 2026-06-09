@@ -6,12 +6,12 @@
 //! and renders every component in its key states. The header toggles One Dark ↔
 //! GitHub Dark so theming is verifiable at a glance.
 
+use flint::prelude::*;
 use gpui::{
     anchored, deferred, div, prelude::*, App, Bounds, Context, Entity, MouseButton, Pixels, Point,
     SharedString, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
-use flint::prelude::*;
 
 /// Demo rows for the `Table` section: `(name, size, modified)`.
 const ROWS: &[(&str, &str, &str)] = &[
