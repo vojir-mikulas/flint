@@ -30,6 +30,41 @@ pub enum ColumnAlign {
     End,
 }
 
+/// A rectangular cell selection, `anchor` → `focus` (either corner may lead).
+/// Caller-owned, like row selection: the table highlights cells inside it and
+/// reports clicks via [`Table::on_cell_click`]; copy-as-TSV is the caller's to
+/// assemble from its own data over [`Self::bounds`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CellRange {
+    pub anchor: (usize, usize),
+    pub focus: (usize, usize),
+}
+
+impl CellRange {
+    /// A 1×1 selection at `(row, col)`.
+    pub fn single(row: usize, col: usize) -> Self {
+        Self {
+            anchor: (row, col),
+            focus: (row, col),
+        }
+    }
+
+    /// Normalized `(row0, col0, row1, col1)`, inclusive, with `0 <= 0-corner`.
+    pub fn bounds(&self) -> (usize, usize, usize, usize) {
+        (
+            self.anchor.0.min(self.focus.0),
+            self.anchor.1.min(self.focus.1),
+            self.anchor.0.max(self.focus.0),
+            self.anchor.1.max(self.focus.1),
+        )
+    }
+
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        let (r0, c0, r1, c1) = self.bounds();
+        (r0..=r1).contains(&row) && (c0..=c1).contains(&col)
+    }
+}
+
 #[derive(Clone)]
 pub struct Column {
     title: SharedString,
@@ -88,6 +123,9 @@ type IndexHandler = Box<dyn Fn(usize, &mut Window, &mut App) + 'static>;
 type VisibleRangeHandler = Rc<dyn Fn(Range<usize>, &mut Window, &mut App) + 'static>;
 /// Row-click handler; also receives the click, for modifier-aware selection.
 type RowClickHandler = Box<dyn Fn(usize, &ClickEvent, &mut Window, &mut App) + 'static>;
+/// Cell-click handler `(row, col, click)`; the click's modifiers drive whether
+/// the caller resets or extends its [`CellRange`] (shift-click extends).
+type CellClickHandler = Rc<dyn Fn(usize, usize, &ClickEvent, &mut Window, &mut App) + 'static>;
 /// Receives the row index and cursor position, to anchor a context menu.
 type RowSecondaryHandler = Box<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static>;
 /// Builds one cell [`AnyElement`] per column for a row.
@@ -155,6 +193,9 @@ pub struct Table<D: 'static = ()> {
     draggable_rows: Option<RowPredicate>,
     scroll_handle: Option<UniformListScrollHandle>,
     on_visible_range: Option<VisibleRangeHandler>,
+    selected_cells: Option<CellRange>,
+    on_cell_click: Option<CellClickHandler>,
+    horizontal: bool,
 }
 
 impl<D: 'static> Table<D> {
@@ -184,7 +225,34 @@ impl<D: 'static> Table<D> {
             draggable_rows: None,
             scroll_handle: None,
             on_visible_range: None,
+            selected_cells: None,
+            on_cell_click: None,
+            horizontal: false,
         }
+    }
+
+    /// The current cell selection to highlight (caller-owned).
+    pub fn selected_cells(mut self, range: Option<CellRange>) -> Self {
+        self.selected_cells = range;
+        self
+    }
+
+    /// Per-cell click handler. The click's modifiers let the caller extend
+    /// (shift-click) vs. reset the [`CellRange`].
+    pub fn on_cell_click(
+        mut self,
+        handler: impl Fn(usize, usize, &ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_cell_click = Some(Rc::new(handler));
+        self
+    }
+
+    /// Lay columns out at their fixed widths and scroll horizontally (header and
+    /// rows together) when they overflow — for wide results. Columns should carry
+    /// fixed widths; flex columns get a default width in this mode.
+    pub fn horizontal(mut self, horizontal: bool) -> Self {
+        self.horizontal = horizontal;
+        self
     }
 
     /// Bind the list's scroll position to a caller-owned handle, so the owner can
@@ -445,7 +513,11 @@ impl<D: 'static> RenderOnce for Table<D> {
         let bg_hover = theme.bg_hover;
         let bg_selected = theme.bg_selected;
         let drop_highlight = theme.bg_active;
+        let cell_selected = theme.accent_ghost;
         let text = theme.text;
+
+        let selected_cells = self.selected_cells;
+        let on_cell_click = self.on_cell_click.clone();
 
         let list = uniform_list("table-rows", row_count, move |range, window, cx| {
             // Report the about-to-render window so a windowed source can fill the
@@ -465,13 +537,23 @@ impl<D: 'static> RenderOnce for Table<D> {
 
                 let laid_out = cells.into_iter().enumerate().map(|(c, cell)| {
                     let column = &columns_for_rows[c];
+                    let is_cell_selected =
+                        selected_cells.is_some_and(|range| range.contains(ix, c));
+                    let on_cell_click = on_cell_click.clone();
                     cell_layout(
                         div()
+                            .id(SharedString::from(format!("cell-{ix}-{c}")))
                             .flex()
                             .items_center()
                             .h_full()
                             .px_2p5()
                             .overflow_hidden()
+                            .when(is_cell_selected, |d| d.bg(cell_selected))
+                            .when_some(on_cell_click, |d, handler| {
+                                d.cursor_pointer().on_click(move |event, window, cx| {
+                                    handler(ix, c, event, window, cx)
+                                })
+                            })
                             .child(cell),
                         column,
                         column.align,
@@ -606,12 +688,42 @@ impl<D: 'static> RenderOnce for Table<D> {
             None => list,
         };
 
-        div()
-            .id(self.id)
-            .flex()
-            .flex_col()
-            .size_full()
-            .child(header)
-            .child(list)
+        // Wide mode: header + rows share one horizontally-scrolling, fixed-width
+        // track, so they scroll in lockstep while the list still virtualizes
+        // vertically. Otherwise columns flex to fit and there's no x-scroll.
+        if self.horizontal {
+            let total: f32 = self
+                .columns
+                .iter()
+                .map(|c| match c.width {
+                    ColumnWidth::Fixed(w) => f32::from(w),
+                    ColumnWidth::Flex => 160.,
+                })
+                .sum();
+            div().id(self.id).flex().flex_col().size_full().child(
+                div()
+                    .id("table-hscroll")
+                    .flex_1()
+                    .min_h(gpui::px(0.))
+                    .overflow_x_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w(gpui::px(total))
+                            .h_full()
+                            .child(header)
+                            .child(list),
+                    ),
+            )
+        } else {
+            div()
+                .id(self.id)
+                .flex()
+                .flex_col()
+                .size_full()
+                .child(header)
+                .child(list)
+        }
     }
 }
