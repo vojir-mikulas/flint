@@ -20,3 +20,4 @@ pub mod text_input;
 pub mod toast;
 pub mod toggle;
 pub mod tooltip;
+pub mod tree;

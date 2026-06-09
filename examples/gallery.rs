@@ -7,6 +7,7 @@
 //! GitHub Dark so theming is verifiable at a glance.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -94,6 +95,10 @@ struct Gallery {
     split_h_drag: Option<DragAnchor>,
     split_v_size: Pixels,
     split_v_drag: Option<DragAnchor>,
+
+    // --- Tree demo: caller-owned expansion (by node path) + selection ---
+    tree_expanded: HashSet<String>,
+    tree_selected: Option<usize>,
 }
 
 impl Gallery {
@@ -167,6 +172,12 @@ impl Gallery {
             split_h_drag: None,
             split_v_size: px(120.),
             split_v_drag: None,
+
+            tree_expanded: ["src", "src/components"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            tree_selected: None,
         }
     }
 
@@ -267,6 +278,72 @@ impl Gallery {
             .border_1()
             .border_color(border)
             .child(outer)
+    }
+
+    /// A virtualized disclosure tree. The example owns expansion (a set of node
+    /// paths) and selection; the component draws indent + chevron and reports
+    /// clicks by index, exactly as RED's schema explorer will drive it.
+    fn tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (dir_color, muted, radius, border) =
+            (theme.blue, theme.text_muted, theme.radius, theme.border);
+        let view = cx.entity();
+
+        let mut flat = Vec::new();
+        flatten_demo(DEMO_TREE, 0, "", &self.tree_expanded, &mut flat);
+        let items: Vec<TreeItem> = flat.iter().map(|r| r.item).collect();
+        let rows = Rc::new(flat);
+
+        let rows_for_render = rows.clone();
+        let rows_for_toggle = rows.clone();
+        let toggle_view = view.clone();
+        let select_view = view.clone();
+
+        div()
+            .w(px(280.))
+            .h(px(240.))
+            .panel(cx)
+            .rounded(radius)
+            .border_1()
+            .border_color(border)
+            .overflow_hidden()
+            .child(
+                Tree::new("demo-tree")
+                    .rows(items)
+                    .row_height(px(24.))
+                    .indent(px(14.))
+                    .selected(self.tree_selected)
+                    .render_row(move |ix, _window, _cx| {
+                        let row = &rows_for_render[ix];
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(if row.is_dir { dir_color } else { muted })
+                                    .child(if row.is_dir { "▣" } else { "·" }),
+                            )
+                            .child(div().text_size(px(12.5)).child(row.label))
+                            .into_any_element()
+                    })
+                    .on_toggle(move |ix, _window, cx| {
+                        let path = rows_for_toggle[ix].path.clone();
+                        toggle_view.update(cx, |this, cx| {
+                            if !this.tree_expanded.remove(&path) {
+                                this.tree_expanded.insert(path);
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .on_select(move |ix, _event, _window, cx| {
+                        select_view.update(cx, |this, cx| {
+                            this.tree_selected = Some(ix);
+                            cx.notify();
+                        });
+                    }),
+            )
     }
 
     /// The active streaming source as a trait object (synthetic or SQLite).
@@ -1107,6 +1184,7 @@ impl Render for Gallery {
         let toasts = self.toasts();
         let tooltip = self.tooltip_demo();
         let split_pane = self.split_pane(cx);
+        let tree = self.tree(cx);
         let table = self.table(cx);
         let secondary_table = self.secondary_table(cx);
         let drag_table = self.drag_table(cx);
@@ -1143,6 +1221,7 @@ impl Render for Gallery {
                 ),
             )
             .child(self.section("Split pane (nested, resizable)", split_pane, cx))
+            .child(self.section("Tree (virtualized, disclosure)", tree, cx))
             .child(self.section("Table", table, cx))
             .child(self.section("Table - right-click menu", secondary_table, cx))
             .child(self.section("Table - in-app drag to folder", drag_table, cx))
@@ -1170,6 +1249,96 @@ impl Render for Gallery {
                 let modal = self.modal(cx);
                 this.child(modal)
             })
+    }
+}
+
+/// A node in the gallery's demo tree. A non-empty `children` makes it a folder.
+struct DemoNode {
+    label: &'static str,
+    children: &'static [DemoNode],
+}
+
+const DEMO_TREE: &[DemoNode] = &[
+    DemoNode {
+        label: "src",
+        children: &[
+            DemoNode {
+                label: "main.rs",
+                children: &[],
+            },
+            DemoNode {
+                label: "app.rs",
+                children: &[],
+            },
+            DemoNode {
+                label: "components",
+                children: &[
+                    DemoNode {
+                        label: "button.rs",
+                        children: &[],
+                    },
+                    DemoNode {
+                        label: "table.rs",
+                        children: &[],
+                    },
+                    DemoNode {
+                        label: "tree.rs",
+                        children: &[],
+                    },
+                ],
+            },
+        ],
+    },
+    DemoNode {
+        label: "docs",
+        children: &[
+            DemoNode {
+                label: "README.md",
+                children: &[],
+            },
+            DemoNode {
+                label: "plan.md",
+                children: &[],
+            },
+        ],
+    },
+];
+
+/// One flattened visible row: the structural `item` the tree chrome draws, plus
+/// the demo payload (label, full path, folder-ness) the gallery renders + toggles.
+struct FlatRow {
+    item: TreeItem,
+    label: &'static str,
+    path: String,
+    is_dir: bool,
+}
+
+/// Walk the demo tree in display order, emitting a row per visible node (a node
+/// is visible when every ancestor's path is in `expanded`).
+fn flatten_demo(
+    nodes: &'static [DemoNode],
+    depth: usize,
+    prefix: &str,
+    expanded: &HashSet<String>,
+    out: &mut Vec<FlatRow>,
+) {
+    for node in nodes {
+        let path = if prefix.is_empty() {
+            node.label.to_string()
+        } else {
+            format!("{prefix}/{}", node.label)
+        };
+        let has_children = !node.children.is_empty();
+        let is_open = expanded.contains(&path);
+        out.push(FlatRow {
+            item: TreeItem::new(depth, has_children, is_open),
+            label: node.label,
+            path: path.clone(),
+            is_dir: has_children,
+        });
+        if has_children && is_open {
+            flatten_demo(node.children, depth + 1, &path, expanded, out);
+        }
     }
 }
 

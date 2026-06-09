@@ -33,6 +33,7 @@ pub use components::text_input::{TextInput, TextInputEvent};
 pub use components::toast::{Toast, ToastVariant};
 pub use components::toggle::Toggle;
 pub use components::tooltip::Tooltip;
+pub use components::tree::{Tree, TreeItem};
 pub use styled_ext::StyledExt;
 pub use theme::{ActiveTheme, Theme};
 
@@ -53,6 +54,7 @@ pub mod prelude {
     pub use crate::components::toast::{Toast, ToastVariant};
     pub use crate::components::toggle::Toggle;
     pub use crate::components::tooltip::Tooltip;
+    pub use crate::components::tree::{Tree, TreeItem};
     pub use crate::styled_ext::StyledExt;
     pub use crate::theme::{ActiveTheme, Theme};
 }
