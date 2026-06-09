@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/vojir-mikulas/flint"
+authors = ["vojir-mikulas <vojir.mikulas@gmail.com>"]
+
+[workspace.dependencies]
+# GPUI pinned to a specific Zed revision. This rev is a SHARED CONTRACT with every
+# consumer (Nyx, RED, …): Cargo unifies two git deps only at the *same* URL+rev,
+# so a consumer MUST resolve gpui to this exact rev (easiest via `flint::gpui`) or
+# it gets a second, incompatible gpui copy. Bumping it is a coordinated, multi-repo
+# event — never casual.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "137e677a0561eb7284cfad1bedccea70155e2473", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "137e677a0561eb7284cfad1bedccea70155e2473", default-features = false }
+
+[package]
+name = "flint"
+description = "In-house GPUI component library + semantic theme layer. Zero app coupling. Extracted from Nyx."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# HARD RULE (carried from Nyx): flint must NEVER depend on any application crate
+# or domain type. It is a generic GPUI component library — `gpui` only.
+[dependencies]
+gpui.workspace = true
+# Grapheme-aware cursor movement in TextInput (same crate GPUI's text uses).
+unicode-segmentation = "1"
+
+# macOS font loading goes through font-kit; other targets use GPUI's own backend.
+# Selected per-OS because Cargo features are additive.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui = { workspace = true, features = ["font-kit"] }
+
+# Dev-only: the gallery example needs `application()` to open a window. As a
+# dev-dependency, the *library* still depends on `gpui` alone.
+[dev-dependencies]
+gpui_platform.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gpui_platform = { workspace = true, features = ["x11", "wayland"] }
+
+[[example]]
+name = "gallery"
+path = "examples/gallery.rs"
+
+[profile.dev]
+# GPUI's dep tree is large; a touch of opt on deps keeps debug builds usable.
+[profile.dev.package."*"]
+opt-level = 2

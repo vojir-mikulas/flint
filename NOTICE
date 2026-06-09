@@ -1,0 +1,30 @@
+Flint
+Copyright 2026 Mikuláš Vojíř (vojir-mikulas)
+
+This program is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+------------------------------------------------------------------------------
+Third-party components and why this project is GPL-3.0-or-later
+------------------------------------------------------------------------------
+
+Flint is built on GPUI, the UI framework from the Zed project
+(https://github.com/zed-industries/zed). The `gpui` / `gpui_platform` framework
+crates are themselves licensed under Apache-2.0. However, GPUI's dependency tree
+pulls in utility crates from the Zed monorepo that are licensed
+GPL-3.0-or-later, reached transitively as:
+
+    gpui -> sum_tree -> ztracing -> zlog
+                        ztracing -> ztracing_macro
+
+  - zlog            GPL-3.0-or-later
+  - ztracing        GPL-3.0-or-later
+  - ztracing_macro  GPL-3.0-or-later
+
+Because these GPL-3.0-or-later components are linked into any binary that uses
+Flint, the combined work is licensed under the GPL-3.0-or-later. Flint's own
+source is GPL-3.0-or-later to match. Apache-2.0 is one-way compatible into
+GPLv3, so the Apache-2.0 components (GPUI and the bulk of the crate graph) are
+included under the terms of the GPL-3.0-or-later combined work.
