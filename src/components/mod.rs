@@ -11,6 +11,7 @@ pub mod code_editor;
 pub mod context_menu;
 pub mod icon_button;
 pub mod modal;
+pub mod palette;
 pub mod progress_bar;
 pub mod scrollbar;
 pub mod segmented;

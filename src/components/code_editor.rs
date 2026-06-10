@@ -324,8 +324,12 @@ impl CodeEditor {
 
     // --- completion seam ---
 
-    /// Byte offset where the identifier ending at the cursor begins, or `None`
-    /// when the cursor isn't right after an identifier character.
+    /// Byte offset where the word ending at the cursor begins, or `None` when no
+    /// completion should be offered. Normally that's the start of the identifier
+    /// under the cursor; as a special case, an empty word immediately after a `.`
+    /// returns the cursor itself, so member-access completion (`table.` → that
+    /// table's columns) fires before any suffix is typed. The replaced span is
+    /// then empty and the candidate is inserted at the cursor.
     fn current_word_start(&self) -> Option<usize> {
         let cursor = self.cursor_offset();
         let bytes = self.content.as_bytes();
@@ -338,7 +342,10 @@ impl CodeEditor {
                 break;
             }
         }
-        (start < cursor).then_some(start)
+        if start < cursor {
+            return Some(start);
+        }
+        (start > 0 && bytes[start - 1] == b'.').then_some(cursor)
     }
 
     /// Recompute the completion popup against the provider. Called after edits.

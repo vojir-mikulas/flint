@@ -81,6 +81,9 @@ pub struct TextInput {
     is_selecting: bool,
     obscured: bool,
     tab_stop: bool,
+    /// Borderless, transparent-background variant for embedding in a styled
+    /// container (e.g. a command palette's input row). The parent owns the chrome.
+    bare: bool,
 }
 
 /// The glyph each character is shown as in an [obscured](TextInput::obscured)
@@ -103,6 +106,7 @@ impl TextInput {
             obscured: false,
             // Tab stop by default so `window.focus_next/prev` walks form fields.
             tab_stop: true,
+            bare: false,
         }
     }
 
@@ -113,9 +117,28 @@ impl TextInput {
         self
     }
 
+    /// Drop the field's own border, background, padding and fixed height so it
+    /// blends into a parent-styled row (e.g. a palette's seamless search input).
+    /// The text size is inherited from the ambient style rather than forced.
+    pub fn bare(mut self) -> Self {
+        self.bare = true;
+        self
+    }
+
     pub fn with_placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
         self.placeholder = placeholder.into();
         self
+    }
+
+    /// Replace the placeholder after construction (e.g. an embedded field whose
+    /// owner sets it from a builder it received later). Does not emit `Change`.
+    pub fn set_placeholder(
+        &mut self,
+        placeholder: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder = placeholder.into();
+        cx.notify();
     }
 
     /// Mask glyphs as bullets (password entry); [`content`](Self::content) still
@@ -893,17 +916,23 @@ impl EventEmitter<TextInputEvent> for TextInput {}
 impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus_handle.is_focused(window);
-        let mut field = div()
-            .flex()
-            .items_center()
-            .h(px(32.))
-            .px(px(10.))
-            .bg(cx.theme().bg_input)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(cx.theme().radius)
-            .text_sm()
-            .text_color(cx.theme().text)
+        let mut field = div().flex().items_center();
+        field = if self.bare {
+            // Seamless: no box of our own; the parent row provides height,
+            // padding and background. Text size inherits from the ambient style.
+            field.w_full().text_color(cx.theme().text)
+        } else {
+            field
+                .h(px(32.))
+                .px(px(10.))
+                .bg(cx.theme().bg_input)
+                .border_1()
+                .border_color(cx.theme().border)
+                .rounded(cx.theme().radius)
+                .text_sm()
+                .text_color(cx.theme().text)
+        };
+        let mut field = field
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .when(self.tab_stop, |this| this.tab_index(0))
@@ -938,7 +967,8 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(div().w_full().child(TextElement { input: cx.entity() }));
-        if focused {
+        // A bare field has no box to ring; its container owns any focus affordance.
+        if focused && !self.bare {
             field = field.focus_ring(cx);
         }
         field

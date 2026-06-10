@@ -97,6 +97,15 @@ struct Gallery {
     // --- Tree demo: caller-owned expansion (by node path) + selection ---
     tree_expanded: HashSet<String>,
     tree_selected: Option<usize>,
+
+    // --- Palette demo: a command palette overlay (⌘K-style) ---
+    palette: Entity<Palette>,
+    palette_open: bool,
+    /// A prompt-mode palette (free-text input, e.g. "go to row").
+    prompt: Entity<Palette>,
+    prompt_open: bool,
+    /// One-line readout of the last command activated / text submitted.
+    last_command: Option<SharedString>,
 }
 
 impl Gallery {
@@ -113,6 +122,50 @@ impl Gallery {
             cx.notify();
         })
         .detach();
+
+        // A command palette seeded with a spread of fake commands. Subscribing
+        // logs the activated command and closes the overlay.
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder("Execute a command…", cx);
+            p.set_items(demo_palette_items(), cx);
+            p
+        });
+        cx.subscribe(&palette, |this, _, event: &PaletteEvent, cx| {
+            match event {
+                PaletteEvent::Activate(id) => {
+                    this.last_command = Some(format!("ran {id:?}").into());
+                    this.palette_open = false;
+                }
+                PaletteEvent::Submit(text) => {
+                    this.last_command = Some(format!("submitted {text:?}").into());
+                    this.palette_open = false;
+                }
+                PaletteEvent::Dismiss => this.palette_open = false,
+            }
+            cx.notify();
+        })
+        .detach();
+
+        // A prompt-mode palette: free-text input, Enter emits `Submit`.
+        let prompt = cx.new(|cx| {
+            let mut p = Palette::new(cx).prompt();
+            p.set_placeholder("Go to row 1–1000000", cx);
+            p
+        });
+        cx.subscribe(&prompt, |this, _, event: &PaletteEvent, cx| {
+            match event {
+                PaletteEvent::Submit(text) => {
+                    this.last_command = Some(format!("go to row {text:?}").into());
+                    this.prompt_open = false;
+                }
+                PaletteEvent::Dismiss => this.prompt_open = false,
+                PaletteEvent::Activate(_) => {}
+            }
+            cx.notify();
+        })
+        .detach();
+
         Self {
             name_input: cx.new(|cx| TextInput::new(cx).with_content("Production")),
             host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("sftp.example.com")),
@@ -125,6 +178,11 @@ impl Gallery {
             segment: 1,
             select: 0,
             select_open: false,
+            palette,
+            palette_open: false,
+            prompt,
+            prompt_open: false,
+            last_command: None,
             row_menu: None,
             drag_items: vec![
                 DragItem {
@@ -1161,6 +1219,14 @@ impl Render for Gallery {
             this.modal_open = true;
             cx.notify();
         });
+        let open_palette = cx.listener(|this, _, _, cx| {
+            this.palette_open = true;
+            cx.notify();
+        });
+        let open_prompt = cx.listener(|this, _, _, cx| {
+            this.prompt_open = true;
+            cx.notify();
+        });
 
         let header = div()
             .id("theme-toggle")
@@ -1237,6 +1303,34 @@ impl Render for Gallery {
                     cx,
                 ),
             )
+            .child(
+                self.section(
+                    "Palette (command palette, ↑/↓/↵, fuzzy)",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    Button::new("open-palette", "Open command palette")
+                                        .variant(ButtonVariant::Secondary)
+                                        .on_click(open_palette),
+                                )
+                                .child(
+                                    Button::new("open-prompt", "Open prompt (go to row)")
+                                        .variant(ButtonVariant::Secondary)
+                                        .on_click(open_prompt),
+                                ),
+                        )
+                        .when_some(self.last_command.clone(), |d, cmd| {
+                            d.child(div().text_sm().text_color(cx.theme().text_muted).child(cmd))
+                        }),
+                    cx,
+                ),
+            )
             .child(self.section("Split pane (nested, resizable)", split_pane, cx))
             .child(self.section("Tree (virtualized, disclosure)", tree, cx))
             .child(self.section("Table", table, cx))
@@ -1266,7 +1360,39 @@ impl Render for Gallery {
                 let modal = self.modal(cx);
                 this.child(modal)
             })
+            // The palette renders its own full-screen overlay; last child = on top.
+            .when(self.palette_open, |this| this.child(self.palette.clone()))
+            .when(self.prompt_open, |this| this.child(self.prompt.clone()))
     }
+}
+
+/// A spread of fake commands for the palette demo — names mirror an editor's
+/// "Execute a command…" list (namespace: action, with a keybinding hint).
+fn demo_palette_items() -> Vec<PaletteItem> {
+    let commands: &[(&str, Option<&str>)] = &[
+        ("git: branch", Some("⌘~")),
+        ("file finder: toggle", Some("⇧⇧")),
+        ("agent: add context server", None),
+        ("agent: chat", Some("↵")),
+        ("agent: chat with follow", Some("⌘↵")),
+        ("agent: clear message queue", Some("⌥⌘⌫")),
+        ("editor: format document", Some("⌥⇧F")),
+        ("workspace: toggle left dock", Some("⌘B")),
+        ("query: run", Some("⌘↵")),
+        ("query: new tab", Some("⌘T")),
+        ("connection: disconnect", None),
+        ("view: settings", Some("⌘,")),
+    ];
+    commands
+        .iter()
+        .map(|(label, hint)| {
+            let item = PaletteItem::new(SharedString::from(label.to_string()), *label);
+            match hint {
+                Some(h) => item.hint(*h),
+                None => item,
+            }
+        })
+        .collect()
 }
 
 /// A node in the gallery's demo tree. A non-empty `children` makes it a folder.
@@ -1379,6 +1505,7 @@ fn main() {
         cx.set_global(Theme::one_dark());
         TextInput::bind_keys(cx);
         CodeEditor::bind_keys(cx);
+        Palette::bind_keys(cx);
 
         // Kick off generation of the 2M-row SQLite table for spike A so it's
         // ready by the time anyone switches the streaming grid to it.
