@@ -74,6 +74,7 @@ struct Gallery {
     stream_source_ix: usize,
     stream_buffer: Rc<RefCell<WindowBuffer>>,
     stream_scroll: UniformListScrollHandle,
+    stream_scrollbar: ScrollbarState,
     synthetic: Rc<SyntheticSource>,
     /// Built lazily once the background-generated DB is ready.
     sqlite: Option<Rc<SqliteSource>>,
@@ -156,6 +157,7 @@ impl Gallery {
             stream_source_ix: 0,
             stream_buffer: Rc::new(RefCell::new(WindowBuffer::default())),
             stream_scroll: UniformListScrollHandle::new(),
+            stream_scrollbar: ScrollbarState::new(),
             synthetic: Rc::new(SyntheticSource::default()),
             sqlite: None,
             db_ready,
@@ -1001,7 +1003,25 @@ impl Gallery {
                     .panel(cx)
                     .rounded(radius)
                     .overflow_hidden()
-                    .child(table),
+                    // The fraction-mapped scrollbar overlays the grid: drag the
+                    // thumb to jump anywhere in the 10M rows instantly.
+                    .relative()
+                    .child(table)
+                    .child(
+                        Scrollbar::new("stream-scrollbar", &self.stream_scrollbar)
+                            .track_list(&self.stream_scroll)
+                            .on_scrub({
+                                let view = cx.entity();
+                                let scroll = self.stream_scroll.clone();
+                                move |fraction, _window, cx| {
+                                    let target = (fraction as f64 * total.saturating_sub(1) as f64)
+                                        .round()
+                                        as usize;
+                                    scroll.scroll_to_item_strict(target, gpui::ScrollStrategy::Top);
+                                    view.update(cx, |_, cx| cx.notify());
+                                }
+                            }),
+                    ),
             )
             .child(div().text_xs().text_color(rownum_color).child(readout))
             .when(!sqlite_note.is_empty(), |this| {

@@ -134,8 +134,11 @@ impl RenderOnce for SplitPane {
         let axis = self.axis;
         let horizontal = axis == Axis::Horizontal;
         let size = self.clamp(self.size);
-        let divider_color = theme.border;
-        let divider_hover = theme.accent;
+        // A calm 1px separator centered in a wider grab gutter; the line picks up
+        // the accent while the gutter is hovered (so the whole strip is grabbable
+        // but the chrome stays a thin line, not a thick bar).
+        let line_color = theme.border;
+        let line_hover = theme.accent;
 
         let first = div()
             .flex_shrink_0()
@@ -154,13 +157,22 @@ impl RenderOnce for SplitPane {
         // Thin draggable gutter; press captures a drag anchor for the overlay.
         let cur_size = self.size;
         let on_drag_start = self.on_drag_start.clone();
+        let line = div()
+            .flex_shrink_0()
+            .bg(line_color)
+            .group_hover("flint-split", move |s| s.bg(line_hover))
+            .when(horizontal, |s| s.w(px(1.)).h_full())
+            .when(!horizontal, |s| s.h(px(1.)).w_full());
         let divider = div()
             .id(self.id.clone())
+            .group("flint-split")
             .flex_shrink_0()
-            .bg(divider_color)
-            .when(horizontal, |s| s.w(px(5.)).h_full().cursor_ew_resize())
-            .when(!horizontal, |s| s.h(px(5.)).w_full().cursor_ns_resize())
-            .hover(move |s| s.bg(divider_hover))
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(horizontal, |s| s.w(px(7.)).h_full().cursor_ew_resize())
+            .when(!horizontal, |s| s.h(px(7.)).w_full().cursor_ns_resize())
+            .child(line)
             .when_some(on_drag_start, |this, handler| {
                 this.on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     handler(

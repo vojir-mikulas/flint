@@ -27,6 +27,7 @@ pub use components::context_menu::{ContextMenu, ContextMenuItem};
 pub use components::icon_button::{IconButton, IconButtonSize};
 pub use components::modal::Modal;
 pub use components::progress_bar::ProgressBar;
+pub use components::scrollbar::{Scrollbar, ScrollbarState};
 pub use components::segmented::Segmented;
 pub use components::select::Select;
 pub use components::split_pane::{DragAnchor, SplitPane};
@@ -51,6 +52,7 @@ pub mod prelude {
     pub use crate::components::icon_button::{IconButton, IconButtonSize};
     pub use crate::components::modal::Modal;
     pub use crate::components::progress_bar::ProgressBar;
+    pub use crate::components::scrollbar::{Scrollbar, ScrollbarState};
     pub use crate::components::segmented::Segmented;
     pub use crate::components::select::Select;
     pub use crate::components::split_pane::{DragAnchor, SplitPane};

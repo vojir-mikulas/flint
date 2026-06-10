@@ -12,6 +12,7 @@ pub mod context_menu;
 pub mod icon_button;
 pub mod modal;
 pub mod progress_bar;
+pub mod scrollbar;
 pub mod segmented;
 pub mod select;
 pub mod split_pane;

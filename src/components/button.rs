@@ -134,6 +134,9 @@ impl RenderOnce for Button {
             ButtonSize::Md => 32.0,
         };
 
+        // Sm scales text and horizontal padding down too — not just height — so a
+        // small button reads as small next to compact chrome (e.g. a toolbar's
+        // 11px labels), rather than oversized 14px text in a short box.
         let base = div()
             .id(self.id)
             .flex()
@@ -141,9 +144,11 @@ impl RenderOnce for Button {
             .justify_center()
             .gap_2()
             .h(gpui::px(height))
-            .px_3()
+            .map(|this| match self.size {
+                ButtonSize::Sm => this.px_2().text_xs(),
+                ButtonSize::Md => this.px_3().text_sm(),
+            })
             .rounded_md()
-            .text_sm()
             .bg(bg)
             .text_color(fg)
             .border_1()

@@ -9,8 +9,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, prelude::*, uniform_list, App, Bounds, ClickEvent, ExternalPaths, MouseButton,
-    Pixels, Point, SharedString, Styled, UniformListScrollHandle, Window,
+    canvas, div, point, prelude::*, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
+    ExternalPaths, IsZero, MouseButton, Pixels, Point, ScrollHandle, ScrollWheelEvent,
+    SharedString, Styled, UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -68,6 +69,8 @@ impl CellRange {
 #[derive(Clone)]
 pub struct Column {
     title: SharedString,
+    /// Dimmer secondary text after the title in the header (e.g. a column type).
+    subtitle: Option<SharedString>,
     width: ColumnWidth,
     align: ColumnAlign,
     sortable: bool,
@@ -77,10 +80,18 @@ impl Column {
     pub fn new(title: impl Into<SharedString>) -> Self {
         Self {
             title: title.into(),
+            subtitle: None,
             width: ColumnWidth::default(),
             align: ColumnAlign::default(),
             sortable: false,
         }
+    }
+
+    /// A dimmer secondary label rendered after the title in the header — the
+    /// design's typed column headers (`email` + `text`).
+    pub fn subtitle(mut self, subtitle: impl Into<SharedString>) -> Self {
+        self.subtitle = Some(subtitle.into());
+        self
     }
 
     pub fn width(mut self, width: Pixels) -> Self {
@@ -192,10 +203,16 @@ pub struct Table<D: 'static = ()> {
     highlighted_rows: Option<RowPredicate>,
     draggable_rows: Option<RowPredicate>,
     scroll_handle: Option<UniformListScrollHandle>,
+    h_scroll_handle: Option<ScrollHandle>,
     on_visible_range: Option<VisibleRangeHandler>,
     selected_cells: Option<CellRange>,
     on_cell_click: Option<CellClickHandler>,
     horizontal: bool,
+    /// Font family for the header + cells (e.g. a monospace data grid). `None`
+    /// inherits the ambient family.
+    font_family: Option<SharedString>,
+    /// Draw 1px separators between cells and rows (a spreadsheet look).
+    grid_lines: bool,
 }
 
 impl<D: 'static> Table<D> {
@@ -224,11 +241,26 @@ impl<D: 'static> Table<D> {
             highlighted_rows: None,
             draggable_rows: None,
             scroll_handle: None,
+            h_scroll_handle: None,
             on_visible_range: None,
             selected_cells: None,
             on_cell_click: None,
             horizontal: false,
+            font_family: None,
+            grid_lines: false,
         }
+    }
+
+    /// Render the header + cells in `family` (e.g. a monospace data grid).
+    pub fn font_family(mut self, family: impl Into<SharedString>) -> Self {
+        self.font_family = Some(family.into());
+        self
+    }
+
+    /// Draw 1px separators between cells and rows for a spreadsheet look.
+    pub fn grid_lines(mut self, grid_lines: bool) -> Self {
+        self.grid_lines = grid_lines;
+        self
     }
 
     /// The current cell selection to highlight (caller-owned).
@@ -259,6 +291,16 @@ impl<D: 'static> Table<D> {
     /// read the offset and scroll programmatically (e.g. rubber-band auto-scroll).
     pub fn track_scroll(mut self, handle: &UniformListScrollHandle) -> Self {
         self.scroll_handle = Some(handle.clone());
+        self
+    }
+
+    /// Bind the horizontal (wide-mode) scroll position to a caller-owned handle.
+    /// Required for the trackpad axis-lock in [`horizontal`](Self::horizontal)
+    /// mode: with it bound, a dominantly-horizontal swipe won't bleed into
+    /// vertical drift (and vice versa), while true diagonal swipes still move
+    /// both axes. The handle must outlive a single render (store it on the view).
+    pub fn track_horizontal_scroll(mut self, handle: &ScrollHandle) -> Self {
+        self.h_scroll_handle = Some(handle.clone());
         self
     }
 
@@ -430,6 +472,10 @@ impl<D: 'static> RenderOnce for Table<D> {
         let columns = self.columns.clone();
         let sort = self.sort;
 
+        let grid_lines = self.grid_lines;
+        let line = theme.border_soft;
+        let font_family = self.font_family.clone();
+
         let on_sort = self.on_sort.clone();
         let caret_asc = self.sort_caret_asc.clone();
         let caret_desc = self.sort_caret_desc.clone();
@@ -450,11 +496,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                 }),
                 _ => None,
             };
-            let color = if sorted {
-                theme.text_muted
-            } else {
-                theme.text_faint
-            };
+            let color = if sorted { theme.text } else { theme.text_muted };
             let on_sort = on_sort.clone();
 
             let cell = div()
@@ -466,8 +508,17 @@ impl<D: 'static> RenderOnce for Table<D> {
                 .px_2p5()
                 .text_color(color)
                 .child(column.title.clone())
+                .when_some(column.subtitle.clone(), |this, sub| {
+                    this.child(
+                        div()
+                            .text_size(gpui::px(10.))
+                            .text_color(theme.text_faint)
+                            .child(sub),
+                    )
+                })
                 .when_some(caret, |this, caret| this.child(caret));
-            let cell = cell_layout(cell, column, column.align);
+            let cell = cell_layout(cell, column, column.align)
+                .when(grid_lines, |c| c.border_r_1().border_color(line));
 
             if column.sortable {
                 cell.cursor_pointer()
@@ -489,6 +540,7 @@ impl<D: 'static> RenderOnce for Table<D> {
             .border_b_1()
             .border_color(theme.border_soft)
             .text_xs()
+            .when_some(font_family.clone(), |d, f| d.font_family(f))
             .children(header_cells);
 
         let columns_for_rows = columns.clone();
@@ -522,8 +574,18 @@ impl<D: 'static> RenderOnce for Table<D> {
         let list = uniform_list("table-rows", row_count, move |range, window, cx| {
             // Report the about-to-render window so a windowed source can fill the
             // buffer (and evict outside it) before `render_row` reads it below.
+            //
+            // `uniform_list` also re-renders a single item (`0..1`) every frame
+            // just to *measure* row size. That call is indistinguishable from a
+            // real viewport except by length — forwarding it would feed the
+            // caller's windowed source a degenerate range each frame, evicting
+            // its buffer and corrupting any scroll-velocity tracking. So only
+            // multi-row (genuine viewport) ranges pass through; a table with a
+            // single row still reports, since `0..1` is then the real viewport.
             if let Some(on_visible_range) = on_visible_range.as_ref() {
-                on_visible_range(range.clone(), window, cx);
+                if range.len() > 1 || row_count <= 1 {
+                    on_visible_range(range.clone(), window, cx);
+                }
             }
             let mut rows = Vec::with_capacity(range.len());
             for ix in range {
@@ -548,6 +610,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                             .h_full()
                             .px_2p5()
                             .overflow_hidden()
+                            .when(grid_lines, |d| d.border_r_1().border_color(line))
                             .when(is_cell_selected, |d| d.bg(cell_selected))
                             .when_some(on_cell_click, |d, handler| {
                                 d.cursor_pointer().on_click(move |event, window, cx| {
@@ -585,6 +648,8 @@ impl<D: 'static> RenderOnce for Table<D> {
                         .w_full()
                         .h(row_height)
                         .text_color(text)
+                        .when(grid_lines, |this| this.border_b_1().border_color(line))
+                        .when_some(font_family.clone(), |this, f| this.font_family(f))
                         .when(is_selected, |this| this.bg(bg_selected))
                         .when(!is_selected, |this| this.hover(move |s| s.bg(bg_hover)))
                         // A forced drop-target highlight (e.g. a platform drag GPUI
@@ -700,22 +765,85 @@ impl<D: 'static> RenderOnce for Table<D> {
                     ColumnWidth::Flex => 160.,
                 })
                 .sum();
-            div().id(self.id).flex().flex_col().size_full().child(
+            let mut hscroll = div()
+                .id("table-hscroll")
+                .flex_1()
+                .min_h(gpui::px(0.))
+                .overflow_x_scroll();
+            if let Some(h) = self.h_scroll_handle.as_ref() {
+                hscroll = hscroll.track_scroll(h);
+            }
+            let mut hscroll = hscroll.child(
                 div()
-                    .id("table-hscroll")
-                    .flex_1()
-                    .min_h(gpui::px(0.))
-                    .overflow_x_scroll()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w(gpui::px(total))
-                            .h_full()
-                            .child(header)
-                            .child(list),
-                    ),
-            )
+                    .flex()
+                    .flex_col()
+                    // Fixed to the columns' combined width so rows + header scroll
+                    // in lockstep — but at least the viewport's width, so when the
+                    // columns are narrower than the pane the rows still fill it.
+                    // Otherwise the blank strip beside the columns sits outside the
+                    // list, and a vertical wheel there lands on the x-only scroll
+                    // container and does nothing.
+                    .w(gpui::px(total))
+                    .min_w(gpui::relative(1.))
+                    .h_full()
+                    .child(header)
+                    .child(list),
+            );
+            // Keep a pure-vertical wheel from being redirected into x-scroll.
+            hscroll.style().restrict_scroll_to_axis = Some(true);
+
+            let mut root = div().id(self.id).flex().flex_col().size_full();
+
+            // The horizontal track and the vertical `uniform_list` are two
+            // independent scroll containers, so GPUI's per-container axis lock
+            // never sees both axes at once — a trackpad swipe's minor-axis jitter
+            // leaks into the other container and the grid drifts diagonally. This
+            // capture-phase overlay arbitrates across both: it picks the dominant
+            // axis per scroll event and, when one clearly dominates, drives only
+            // that handle and swallows the event; a true diagonal (within 2:1)
+            // falls through so the native handlers still move both axes.
+            if let (Some(h), Some(v)) = (self.h_scroll_handle.clone(), self.scroll_handle.clone()) {
+                let v = v.0.borrow().base_handle.clone();
+                root = root.relative().child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds: Bounds<Pixels>, _, window, _| {
+                            let view = window.current_view();
+                            let line_height = window.line_height();
+                            window.on_mouse_event(
+                                move |event: &ScrollWheelEvent, phase, _window, cx| {
+                                    if phase != DispatchPhase::Capture
+                                        || !bounds.contains(&event.position)
+                                    {
+                                        return;
+                                    }
+                                    let delta = event.delta.pixel_delta(line_height);
+                                    let (ax, ay) = (delta.x.abs(), delta.y.abs());
+                                    // A clean single-axis wheel falls through to
+                                    // the native handlers untouched.
+                                    if ax.is_zero() || ay.is_zero() {
+                                        return;
+                                    }
+                                    const LOCK_RATIO: f32 = 2.0;
+                                    if ax > ay * LOCK_RATIO {
+                                        h.set_offset(h.offset() + point(delta.x, gpui::px(0.)));
+                                    } else if ay > ax * LOCK_RATIO {
+                                        v.set_offset(v.offset() + point(gpui::px(0.), delta.y));
+                                    } else {
+                                        return; // diagonal: let both axes move
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify(view);
+                                },
+                            );
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                );
+            }
+
+            root.child(hscroll)
         } else {
             div()
                 .id(self.id)
