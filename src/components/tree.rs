@@ -48,6 +48,8 @@ impl TreeItem {
 type RowRenderer = Rc<dyn Fn(usize, &mut Window, &mut App) -> gpui::AnyElement + 'static>;
 type SelectHandler = Rc<dyn Fn(usize, &ClickEvent, &mut Window, &mut App) + 'static>;
 type IndexHandler = Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>;
+/// Draws the disclosure indicator for a parent row, given its expanded state.
+type DisclosureRenderer = Rc<dyn Fn(bool, &mut Window, &mut App) -> gpui::AnyElement + 'static>;
 
 #[derive(IntoElement)]
 pub struct Tree {
@@ -60,6 +62,7 @@ pub struct Tree {
     on_select: Option<SelectHandler>,
     on_toggle: Option<IndexHandler>,
     on_activate: Option<IndexHandler>,
+    disclosure: Option<DisclosureRenderer>,
     scroll_handle: Option<UniformListScrollHandle>,
 }
 
@@ -75,6 +78,7 @@ impl Tree {
             on_select: None,
             on_toggle: None,
             on_activate: None,
+            disclosure: None,
             scroll_handle: None,
         }
     }
@@ -118,6 +122,18 @@ impl Tree {
         self
     }
 
+    /// Override the disclosure indicator drawn in the chevron slot of parent
+    /// rows. The renderer receives the row's `expanded` state and returns the
+    /// element (e.g. an icon). Leaf rows never call it. Defaults to a small
+    /// `▶`/`▼` text glyph when unset.
+    pub fn disclosure(
+        mut self,
+        renderer: impl Fn(bool, &mut Window, &mut App) -> gpui::AnyElement + 'static,
+    ) -> Self {
+        self.disclosure = Some(Rc::new(renderer));
+        self
+    }
+
     pub fn on_select(
         mut self,
         handler: impl Fn(usize, &ClickEvent, &mut Window, &mut App) + 'static,
@@ -149,6 +165,7 @@ impl RenderOnce for Tree {
         let row_count = rows.len();
 
         let render_row = self.render_row.clone();
+        let disclosure = self.disclosure.clone();
         let on_select = self.on_select.clone();
         let on_toggle = self.on_toggle.clone();
         let on_activate = self.on_activate.clone();
@@ -173,8 +190,15 @@ impl RenderOnce for Tree {
                     .map(|r| r(ix, window, cx))
                     .unwrap_or_else(|| div().into_any_element());
 
-                // Chevron slot: a disclosure triangle for parents, else an empty
-                // spacer so labels line up across leaf and parent rows.
+                // Chevron slot: a disclosure indicator for parents, else an empty
+                // spacer so labels line up across leaf and parent rows. A custom
+                // `disclosure` renderer wins; otherwise a small text glyph.
+                let custom_disclosure = if item.has_children {
+                    disclosure.as_ref().map(|r| r(item.expanded, window, cx))
+                } else {
+                    None
+                };
+                let glyph_disclosure = item.has_children && disclosure.is_none();
                 let chevron = div()
                     .w(px(16.))
                     .flex_shrink_0()
@@ -182,7 +206,8 @@ impl RenderOnce for Tree {
                     .items_center()
                     .justify_center()
                     .text_color(chevron_color)
-                    .when(item.has_children, |d| {
+                    .when_some(custom_disclosure, |d, el| d.child(el))
+                    .when(glyph_disclosure, |d| {
                         d.text_size(px(9.))
                             .child(if item.expanded { "▼" } else { "▶" })
                     });
