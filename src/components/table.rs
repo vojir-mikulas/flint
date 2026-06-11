@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, point, prelude::*, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
-    ExternalPaths, IsZero, MouseButton, Pixels, Point, ScrollHandle, ScrollWheelEvent,
+    ElementId, ExternalPaths, IsZero, MouseButton, Pixels, Point, ScrollHandle, ScrollWheelEvent,
     SharedString, Styled, UniformListScrollHandle, Window,
 };
 
@@ -604,7 +604,15 @@ impl<D: 'static> RenderOnce for Table<D> {
                     let on_cell_click = on_cell_click.clone();
                     cell_layout(
                         div()
-                            .id(SharedString::from(format!("cell-{ix}-{c}")))
+                            // A stable, allocation-free per-cell id: `(row, col)`
+                            // packed into one integer (col in the low 16 bits — no
+                            // table has 2^16 columns), under a `'static` name. The
+                            // old `format!("cell-{ix}-{c}")` heap-allocated a
+                            // `SharedString` for every visible cell every frame.
+                            .id(ElementId::NamedInteger(
+                                SharedString::new_static("cell"),
+                                ((ix as u64) << 16) | (c as u64),
+                            ))
                             .flex()
                             .items_center()
                             .h_full()

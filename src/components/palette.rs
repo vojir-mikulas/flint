@@ -84,6 +84,8 @@ pub struct Palette {
 }
 
 const ROW_HEIGHT: gpui::Pixels = px(34.);
+/// Most command rows shown before the list scrolls (caps the panel height).
+const MAX_VISIBLE_ROWS: usize = 10;
 
 impl Palette {
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -331,11 +333,16 @@ impl Render for Palette {
                 .child("No matching commands")
                 .into_any_element()
         } else {
+            // `uniform_list` virtualizes against a *definite* height, so size the
+            // list to its rows (capped) — a content-sized parent would collapse
+            // the `flex_1` list to nothing and show no commands.
+            let visible = count.clamp(1, MAX_VISIBLE_ROWS);
+            let body_h = px(visible as f32 * f32::from(ROW_HEIGHT) + 12.0);
             div()
                 .flex()
                 .flex_col()
                 .p(px(6.))
-                .max_h(px(380.))
+                .h(body_h)
                 .child(list)
                 .into_any_element()
         };
@@ -366,6 +373,9 @@ impl Render for Palette {
             .absolute()
             .inset_0()
             .flex()
+            // Anchor the panel to the top (sized to its content); without this the
+            // default `align-items: stretch` blows the panel up to full height.
+            .items_start()
             .justify_center()
             .pt(gpui::relative(0.11))
             .bg(gpui::black().opacity(0.45))
