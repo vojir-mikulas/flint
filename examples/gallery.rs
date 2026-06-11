@@ -56,6 +56,7 @@ struct Gallery {
     name_input: Entity<TextInput>,
     host_input: Entity<TextInput>,
     password_input: Entity<TextInput>,
+    number: Entity<NumberInput>,
     tab: usize,
     modal_open: bool,
     selected_row: Option<usize>,
@@ -170,6 +171,14 @@ impl Gallery {
             name_input: cx.new(|cx| TextInput::new(cx).with_content("Production")),
             host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("sftp.example.com")),
             password_input: cx.new(|cx| TextInput::new(cx).with_placeholder("password").obscured()),
+            number: cx.new(|cx| {
+                let mut n = NumberInput::new("font-size", cx)
+                    .range(8.0, 32.0)
+                    .step(1.0)
+                    .decimals(2);
+                n.set_value(15.0, cx);
+                n
+            }),
             tab: 0,
             modal_open: false,
             selected_row: Some(2),
@@ -593,6 +602,10 @@ impl Gallery {
         )
     }
 
+    fn number_input(&self) -> impl IntoElement {
+        self.number.clone()
+    }
+
     fn context_menu(&self) -> impl IntoElement {
         ContextMenu::new("demo-menu")
             .item(ContextMenuItem::new("download", "Download").shortcut("⌘D"))
@@ -613,7 +626,19 @@ impl Gallery {
             .gap_2()
             .child(Toast::new("Connected to Production").variant(ToastVariant::Success))
             .child(Toast::new("Uploading 3 files…").variant(ToastVariant::Info))
+            .child(Toast::new("Disk almost full").variant(ToastVariant::Warning))
             .child(Toast::new("Permission denied").variant(ToastVariant::Error))
+            .child(
+                Toast::new("Dismiss me")
+                    .variant(ToastVariant::Info)
+                    .on_close(|_, _| {}),
+            )
+            .child(
+                Toast::new("Exporting… 62%")
+                    .variant(ToastVariant::Info)
+                    .progress(0.62)
+                    .on_close(|_, _| {}),
+            )
     }
 
     fn tooltip_demo(&self) -> impl IntoElement {
@@ -1261,6 +1286,7 @@ impl Render for Gallery {
         let toggles = self.toggles(cx);
         let segmented = self.segmented(cx);
         let select = self.select(cx);
+        let number_input = self.number_input();
         let context_menu = self.context_menu();
         let toasts = self.toasts();
         let tooltip = self.tooltip_demo();
@@ -1289,6 +1315,7 @@ impl Render for Gallery {
             .child(self.section("Toggle", toggles, cx))
             .child(self.section("Segmented", segmented, cx))
             .child(self.section("Select", select, cx))
+            .child(self.section("Number input", number_input, cx))
             .child(self.section("Context menu", context_menu, cx))
             .child(self.section("Toasts", toasts, cx))
             .child(self.section("Tooltip", tooltip, cx))

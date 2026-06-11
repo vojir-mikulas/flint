@@ -12,6 +12,7 @@ pub mod context_menu;
 pub mod floating;
 pub mod icon_button;
 pub mod modal;
+pub mod number_input;
 pub mod palette;
 pub mod progress_bar;
 pub mod scrollbar;

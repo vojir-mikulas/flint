@@ -13,7 +13,7 @@ use gpui::{
     Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -78,6 +78,12 @@ pub struct TextInput {
     /// shaped line. Kept ≥ 0; recomputed each frame to follow the cursor so long
     /// single-line values stay reachable. See [`TextElement::prepaint`].
     scroll_offset: Pixels,
+    /// Horizontal alignment of the text within the field. Only [`TextAlign::Left`]
+    /// and [`TextAlign::Center`] are honoured (a single line never needs Right).
+    align: TextAlign,
+    /// The alignment shift baked into the last paint (0 unless centered and the
+    /// text fits). Recorded so mouse/IME hit-testing inverts it. See `prepaint`.
+    align_offset: Pixels,
     is_selecting: bool,
     obscured: bool,
     tab_stop: bool,
@@ -102,6 +108,8 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             scroll_offset: px(0.),
+            align: TextAlign::Left,
+            align_offset: px(0.),
             is_selecting: false,
             obscured: false,
             // Tab stop by default so `window.focus_next/prev` walks form fields.
@@ -122,6 +130,15 @@ impl TextInput {
     /// The text size is inherited from the ambient style rather than forced.
     pub fn bare(mut self) -> Self {
         self.bare = true;
+        self
+    }
+
+    /// Horizontal alignment of the text. Defaults to [`TextAlign::Left`]; pass
+    /// [`TextAlign::Center`] for a centered value (e.g. a numeric stepper). When
+    /// the text outgrows the field it falls back to left-aligned scrolling so the
+    /// caret stays visible while typing.
+    pub fn align(mut self, align: TextAlign) -> Self {
+        self.align = align;
         self
     }
 
@@ -448,7 +465,9 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_offset)
+        line.closest_index_for_x(
+            position.x - bounds.left() - self.align_offset + self.scroll_offset,
+        )
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -638,11 +657,13 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_offset,
+                bounds.left() + self.align_offset + last_layout.x_for_index(range.start)
+                    - self.scroll_offset,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_offset,
+                bounds.left() + self.align_offset + last_layout.x_for_index(range.end)
+                    - self.scroll_offset,
                 bounds.bottom(),
             ),
         ))
@@ -656,7 +677,8 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x + self.scroll_offset)?;
+        let utf8_index = last_layout
+            .index_for_x(point.x - line_point.x - self.align_offset + self.scroll_offset)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -674,6 +696,8 @@ struct PrepaintState {
     /// The scroll offset baked into `cursor`/`selection` this frame; the line is
     /// painted shifted left by the same amount.
     scroll_offset: Pixels,
+    /// The alignment shift baked into this frame's paint positions.
+    align_offset: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -730,6 +754,7 @@ impl Element for TextElement {
         let obscured = input.obscured;
         let marked_range = input.marked_range.clone();
         let prev_scroll = input.scroll_offset;
+        let align = input.align;
         let style = window.text_style();
 
         let is_placeholder = content.is_empty();
@@ -815,7 +840,15 @@ impl Element for TextElement {
         let max_scroll = (line.width() + caret_margin - visible_width).max(px(0.));
         scroll_offset = scroll_offset.min(max_scroll).max(px(0.));
 
-        let cursor_pos = cursor_pos - scroll_offset;
+        // Center the line when it fits; once it outgrows the field the offset
+        // collapses to 0 and we fall back to left-aligned scrolling. `scroll_offset`
+        // is already clamped to 0 whenever the line fits, so the two never fight.
+        let align_offset = match align {
+            TextAlign::Center => ((visible_width - line.width()) * 0.5).max(px(0.)),
+            _ => px(0.),
+        };
+
+        let cursor_pos = cursor_pos - scroll_offset + align_offset;
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
@@ -832,12 +865,14 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(map_offset(selected_range.start))
+                            bounds.left() + align_offset
+                                + line.x_for_index(map_offset(selected_range.start))
                                 - scroll_offset,
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(map_offset(selected_range.end))
+                            bounds.left() + align_offset
+                                + line.x_for_index(map_offset(selected_range.end))
                                 - scroll_offset,
                             bounds.bottom(),
                         ),
@@ -852,6 +887,7 @@ impl Element for TextElement {
             cursor,
             selection,
             scroll_offset,
+            align_offset,
         }
     }
 
@@ -872,6 +908,7 @@ impl Element for TextElement {
             cx,
         );
         let scroll_offset = prepaint.scroll_offset;
+        let align_offset = prepaint.align_offset;
         let line = prepaint.line.take().unwrap();
         // Clip to the field so a line wider than `bounds` doesn't spill into the
         // padding or past the rounded border; the line itself is shifted left by
@@ -881,7 +918,7 @@ impl Element for TextElement {
                 window.paint_quad(selection);
             }
             line.paint(
-                point(bounds.left() - scroll_offset, bounds.top()),
+                point(bounds.left() - scroll_offset + align_offset, bounds.top()),
                 window.line_height(),
                 gpui::TextAlign::Left,
                 None,
@@ -901,6 +938,7 @@ impl Element for TextElement {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
             input.scroll_offset = scroll_offset;
+            input.align_offset = align_offset;
         });
     }
 }

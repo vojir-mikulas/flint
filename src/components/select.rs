@@ -3,12 +3,15 @@
 //! A single-select dropdown. Stateless: the caller owns both the selected index
 //! and the open flag, reacting via [`on_toggle`](Select::on_toggle) and
 //! [`on_select`](Select::on_select). The list is deferred+anchored so it floats
-//! above clipping containers.
+//! above clipping containers. The disclosure and check glyphs are caller-supplied
+//! ([`chevron`](Select::chevron) / [`check`](Select::check)) so the component
+//! stays domain-free, falling back to unicode marks when unset.
 
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, App, Bounds, FontWeight, Pixels, SharedString, Window,
+    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, FontWeight, Pixels, SharedString,
+    Window,
 };
 
 use crate::components::floating::floating;
@@ -25,6 +28,8 @@ pub struct Select {
     selected: usize,
     open: bool,
     placeholder: SharedString,
+    chevron: Option<AnyElement>,
+    check: Option<AnyElement>,
     on_toggle: Option<ToggleHandler>,
     on_select: Option<SelectHandler>,
 }
@@ -37,6 +42,8 @@ impl Select {
             selected: 0,
             open: false,
             placeholder: "Select…".into(),
+            chevron: None,
+            check: None,
             on_toggle: None,
             on_select: None,
         }
@@ -60,6 +67,19 @@ impl Select {
     /// Shown when `selected` is out of range (no selection).
     pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
         self.placeholder = placeholder.into();
+        self
+    }
+
+    /// Disclosure glyph for the trigger. Caller-supplied so the component stays
+    /// domain-free; falls back to a stacked unicode chevron when unset.
+    pub fn chevron(mut self, icon: impl IntoElement) -> Self {
+        self.chevron = Some(icon.into_any_element());
+        self
+    }
+
+    /// Mark glyph drawn on the selected row. Falls back to a unicode check.
+    pub fn check(mut self, icon: impl IntoElement) -> Self {
+        self.check = Some(icon.into_any_element());
         self
     }
 
@@ -111,13 +131,29 @@ impl RenderOnce for Select {
         //
         // While open, the trigger carries no click handler: dismissal is owned by
         // the list's `on_mouse_down_out`, which would otherwise immediately reopen.
+        // The disclosure glyph: the caller's lucide icon when supplied, else a
+        // stacked unicode chevron so the domain-free gallery still renders.
+        let disclosure = match self.chevron {
+            Some(icon) => div().flex().items_center().child(icon).into_any_element(),
+            None => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .text_color(theme.accent)
+                .text_size(px(9.))
+                .line_height(px(6.))
+                .child("⌃")
+                .child("⌄")
+                .into_any_element(),
+        };
+
         let trigger = div()
             .id(self.id.clone())
             .flex()
             .items_center()
             .gap_1p5()
-            .h(px(28.))
-            .px_2p5()
+            .h(px(24.))
+            .px_2()
             .rounded(theme.radius)
             .bg(theme.bg_input)
             .border_1()
@@ -137,18 +173,7 @@ impl RenderOnce for Select {
             .tab_index(0)
             .focus(move |s| s.focus_ring_color(ring, glow))
             .child(div().child(current))
-            .child(
-                // Stacked chevron-up / chevron-down — the macOS popup indicator.
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .text_color(theme.accent)
-                    .text_size(px(9.))
-                    .line_height(px(6.))
-                    .child("⌃")
-                    .child("⌄"),
-            )
+            .child(disclosure)
             .child(
                 // Invisible overlay that records the trigger's window bounds so the
                 // menu can anchor to its bottom-left. Re-renders only on a change.
@@ -174,19 +199,27 @@ impl RenderOnce for Select {
             });
 
         // One row per option, mirroring the ContextMenu item style. The selected
-        // row reads in the accent color and shows a check.
-        let rows = self.options.into_iter().enumerate().map(|(ix, label)| {
+        // row reads in the accent color and shows a check. The caller's lucide
+        // check (if any) is moved onto whichever row is selected; the rest fall
+        // back to a unicode mark.
+        let mut check = self.check;
+        let rows = self.options.into_iter().enumerate().map(move |(ix, label)| {
             let is_selected = ix == selected;
             let handler = on_select.clone();
+            let mark = is_selected.then(|| {
+                check
+                    .take()
+                    .unwrap_or_else(|| div().text_xs().child("✓").into_any_element())
+            });
             div()
                 .id(ix)
                 .flex()
                 .items_center()
-                .gap_2p5()
-                .px_2p5()
-                .py_1p5()
+                .gap_2()
+                .px_2()
+                .py_1()
                 .rounded(px(4.))
-                .text_sm()
+                .text_xs()
                 .text_color(if is_selected {
                     theme.accent
                 } else {
@@ -194,10 +227,10 @@ impl RenderOnce for Select {
                 })
                 .cursor_pointer()
                 .tab_index(0)
-                .focus(move |s| s.focus_ring_color(ring, glow))
+                .focus(move |s| s.bg(theme.bg_hover).focus_ring_color(ring, glow))
                 .hover(move |s| s.bg(theme.bg_hover))
                 .child(div().flex_1().child(label))
-                .when(is_selected, |this| this.child(div().text_xs().child("✓")))
+                .when_some(mark, |this, mark| this.child(mark))
                 .when_some(handler, |this, handler| {
                     this.on_click(move |_, window, cx| handler(ix, window, cx))
                 })

@@ -27,6 +27,7 @@ pub use components::context_menu::{ContextMenu, ContextMenuItem};
 pub use components::floating::{floating, Floating};
 pub use components::icon_button::{IconButton, IconButtonSize};
 pub use components::modal::Modal;
+pub use components::number_input::{NumberInput, NumberInputEvent};
 pub use components::palette::{Palette, PaletteEvent, PaletteItem};
 pub use components::progress_bar::ProgressBar;
 pub use components::scrollbar::{Scrollbar, ScrollbarState};
@@ -54,6 +55,7 @@ pub mod prelude {
     pub use crate::components::floating::{floating, Floating};
     pub use crate::components::icon_button::{IconButton, IconButtonSize};
     pub use crate::components::modal::Modal;
+    pub use crate::components::number_input::{NumberInput, NumberInputEvent};
     pub use crate::components::palette::{Palette, PaletteEvent, PaletteItem};
     pub use crate::components::progress_bar::ProgressBar;
     pub use crate::components::scrollbar::{Scrollbar, ScrollbarState};
