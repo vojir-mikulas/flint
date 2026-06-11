@@ -7,7 +7,9 @@
 
 use std::rc::Rc;
 
-use gpui::{div, point, prelude::*, px, App, SharedString, Window};
+use gpui::{
+    canvas, div, point, prelude::*, px, App, Bounds, FontWeight, Pixels, SharedString, Window,
+};
 
 use crate::components::floating::floating;
 use crate::styled_ext::StyledExt;
@@ -74,30 +76,47 @@ impl Select {
 }
 
 impl RenderOnce for Select {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.theme();
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let open = self.open;
         let selected = self.selected;
+
+        // The menu is anchored to the trigger's *measured* window bounds, not to a
+        // layout-flow guess — a stateless `anchored()` in relative mode lands a
+        // trigger-height too low. A `canvas` overlay records the trigger's bounds
+        // each frame; the menu then drops from its bottom-left. (Mirrors how Zed's
+        // `PopoverMenu` positions against `child_bounds`.)
+        let bounds_state = window.use_keyed_state(
+            SharedString::from(format!("{}__sel_bounds", self.id)),
+            cx,
+            |_, _| None::<Bounds<Pixels>>,
+        );
+        let trigger_bounds = *bounds_state.read(cx);
+        let measure = bounds_state.clone();
         let on_toggle = self.on_toggle.map(Rc::new);
         let on_select = self.on_select.map(Rc::new);
         let ring = theme.accent;
         let glow = theme.accent_ghost;
 
+        let has_selection = self.options.get(selected).is_some();
         let current = self
             .options
             .get(selected)
             .cloned()
             .unwrap_or_else(|| self.placeholder.clone());
 
+        // Native macOS popup-button styling: the trigger sizes to its content
+        // (not full width), reads the selection in the accent color, and carries
+        // a stacked up/down chevron as its disclosure glyph.
+        //
         // While open, the trigger carries no click handler: dismissal is owned by
         // the list's `on_mouse_down_out`, which would otherwise immediately reopen.
         let trigger = div()
             .id(self.id.clone())
             .flex()
             .items_center()
-            .gap_2()
-            .w_full()
-            .h(px(32.))
+            .gap_1p5()
+            .h(px(28.))
             .px_2p5()
             .rounded(theme.radius)
             .bg(theme.bg_input)
@@ -108,12 +127,45 @@ impl RenderOnce for Select {
                 theme.border
             })
             .text_sm()
-            .text_color(theme.text)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if has_selection {
+                theme.accent
+            } else {
+                theme.text_faint
+            })
             .cursor_pointer()
             .tab_index(0)
             .focus(move |s| s.focus_ring_color(ring, glow))
-            .child(div().flex_1().child(current))
-            .child(div().text_xs().text_color(theme.text_faint).child("⌄"))
+            .child(div().child(current))
+            .child(
+                // Stacked chevron-up / chevron-down — the macOS popup indicator.
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .text_color(theme.accent)
+                    .text_size(px(9.))
+                    .line_height(px(6.))
+                    .child("⌃")
+                    .child("⌄"),
+            )
+            .child(
+                // Invisible overlay that records the trigger's window bounds so the
+                // menu can anchor to its bottom-left. Re-renders only on a change.
+                canvas(
+                    move |bounds, _, cx| {
+                        measure.update(cx, |stored, cx| {
+                            if *stored != Some(bounds) {
+                                *stored = Some(bounds);
+                                cx.notify();
+                            }
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .when(!open, |this| {
                 this.hover(|s| s.border_color(theme.border_strong))
                     .when_some(on_toggle.clone(), |this, toggle| {
@@ -143,7 +195,7 @@ impl RenderOnce for Select {
                 .cursor_pointer()
                 .tab_index(0)
                 .focus(move |s| s.focus_ring_color(ring, glow))
-                .hover(move |s| s.bg(theme.accent).text_color(theme.on_accent))
+                .hover(move |s| s.bg(theme.bg_hover))
                 .child(div().flex_1().child(label))
                 .when(is_selected, |this| this.child(div().text_xs().child("✓")))
                 .when_some(handler, |this, handler| {
@@ -152,10 +204,15 @@ impl RenderOnce for Select {
         });
 
         let list = div()
+            .id("select-menu")
             .occlude()
             .flex()
             .flex_col()
-            .min_w(px(180.))
+            .min_w(px(160.))
+            // Cap the height and scroll so a long option list (e.g. every installed
+            // font family) stays inside the viewport instead of running off-screen.
+            .max_h(px(320.))
+            .overflow_y_scroll()
             .p_1()
             .bg(theme.bg_elevated)
             .border_1()
@@ -167,10 +224,18 @@ impl RenderOnce for Select {
             })
             .children(rows);
 
-        div().relative().w_full().child(trigger).when(open, |this| {
-            // Drop the list just below the 32px trigger (+4px gap); `floating`
-            // defers it above clipping containers and fits it in the window.
-            this.child(floating(list).offset(point(px(0.), px(36.))))
-        })
+        // Anchor the menu to the trigger's measured bottom-left (window coords),
+        // dropped 4px clear of it. Until the first frame measures the trigger,
+        // `trigger_bounds` is None and the menu simply waits a frame.
+        div()
+            .child(trigger)
+            .when(open, |this| match trigger_bounds {
+                Some(b) => this.child(
+                    floating(list)
+                        .at(b.bottom_left())
+                        .offset(point(px(0.), px(4.))),
+                ),
+                None => this,
+            })
     }
 }
