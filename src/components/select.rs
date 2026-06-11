@@ -7,8 +7,9 @@
 
 use std::rc::Rc;
 
-use gpui::{anchored, deferred, div, point, prelude::*, px, Anchor, App, SharedString, Window};
+use gpui::{div, point, prelude::*, px, App, SharedString, Window};
 
+use crate::components::floating::floating;
 use crate::styled_ext::StyledExt;
 use crate::theme::ActiveTheme;
 
@@ -167,14 +168,9 @@ impl RenderOnce for Select {
             .children(rows);
 
         div().relative().w_full().child(trigger).when(open, |this| {
-            this.child(deferred(
-                anchored()
-                    .anchor(Anchor::TopLeft)
-                    // Drop the list just below the 32px trigger (+4px gap).
-                    .offset(point(px(0.), px(36.)))
-                    .snap_to_window_with_margin(px(8.))
-                    .child(list),
-            ))
+            // Drop the list just below the 32px trigger (+4px gap); `floating`
+            // defers it above clipping containers and fits it in the window.
+            this.child(floating(list).offset(point(px(0.), px(36.))))
         })
     }
 }

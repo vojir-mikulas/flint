@@ -24,6 +24,7 @@ pub use components::code_editor::{
     CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
 };
 pub use components::context_menu::{ContextMenu, ContextMenuItem};
+pub use components::floating::{floating, Floating};
 pub use components::icon_button::{IconButton, IconButtonSize};
 pub use components::modal::Modal;
 pub use components::palette::{Palette, PaletteEvent, PaletteItem};
@@ -50,6 +51,7 @@ pub mod prelude {
         CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
     };
     pub use crate::components::context_menu::{ContextMenu, ContextMenuItem};
+    pub use crate::components::floating::{floating, Floating};
     pub use crate::components::icon_button::{IconButton, IconButtonSize};
     pub use crate::components::modal::Modal;
     pub use crate::components::palette::{Palette, PaletteEvent, PaletteItem};

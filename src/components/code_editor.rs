@@ -25,6 +25,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::components::floating::floating;
 use crate::theme::{ActiveTheme, Theme};
 
 actions!(
@@ -368,6 +369,25 @@ impl CodeEditor {
                 selected: 0,
             });
         }
+    }
+
+    /// Window-coordinate point just below the start of the word being completed,
+    /// where the popup's top-left should sit. Derived from the geometry cached at
+    /// the last paint (`last_bounds` is the text element's origin in window
+    /// space), so it tracks the caret and scrolls with the text. `None` until the
+    /// editor has painted, or when there's no open completion.
+    fn completion_anchor(&self) -> Option<Point<Pixels>> {
+        let c = self.completion.as_ref()?;
+        let bounds = self.last_bounds?;
+        if self.last_lines.is_empty() {
+            return None;
+        }
+        let (line, col) = self.line_col(c.start);
+        let line = line.min(self.last_lines.len() - 1);
+        let x = self.last_lines[line].x_for_index(col);
+        // Drop one line below the word's line, plus a small gap off the caret.
+        let y = self.last_line_height * (line as f32 + 1.0) + px(2.);
+        Some(bounds.origin + point(x, y))
     }
 
     fn completion_move(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1004,18 +1024,18 @@ impl Render for CodeEditor {
 
         let focused = self.focus_handle.is_focused(window);
 
-        // Completion popup (the seam, exercised). Docked bottom-left so it needs
-        // no caret geometry; M-future may caret-anchor it.
-        let popup = self.completion.as_ref().map(|c| {
-            div()
-                .absolute()
-                .bottom_1()
-                .left(px(56.))
+        // Completion popup, caret-anchored: `floating` drops it just below the
+        // word being completed (in window space, via the cached caret geometry)
+        // and snaps it inside the viewport, escaping the scroll container's clip.
+        let popup = self.completion_anchor().and_then(|at| {
+            let c = self.completion.as_ref()?;
+            let list = div()
                 .max_w(px(280.))
                 .bg(theme.bg_elevated)
                 .border_1()
                 .border_color(theme.border)
                 .rounded(theme.radius_sm)
+                .shadow_lg()
                 .py_1()
                 .child(div().flex().flex_col().children(
                     c.candidates.iter().take(8).enumerate().map(|(i, cand)| {
@@ -1027,7 +1047,8 @@ impl Render for CodeEditor {
                             .when(i == c.selected, |d| d.bg(theme.bg_selected))
                             .child(cand.clone())
                     }),
-                ))
+                ));
+            Some(floating(list).at(at))
         });
 
         div()

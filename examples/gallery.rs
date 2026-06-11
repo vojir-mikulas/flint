@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    anchored, deferred, div, prelude::*, px, App, Axis, Bounds, Context, Entity, MouseButton,
-    Pixels, Point, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, App, Axis, Bounds, Context, Entity, MouseButton, Pixels, Point,
+    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -773,9 +773,7 @@ impl Gallery {
                                 cx.notify();
                             });
                         })
-                        .child(deferred(
-                            anchored().position(pos).child(div().occlude().child(menu)),
-                        )),
+                        .child(floating(div().occlude().child(menu)).at(pos)),
                 )
             })
     }

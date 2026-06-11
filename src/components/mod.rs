@@ -9,6 +9,7 @@ pub mod badge;
 pub mod button;
 pub mod code_editor;
 pub mod context_menu;
+pub mod floating;
 pub mod icon_button;
 pub mod modal;
 pub mod palette;
