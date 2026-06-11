@@ -4,8 +4,11 @@
 //! field, and a `+` button, all inside one bordered box (the Zed style).
 //! Stateful: a [`Render`] view held in an `Entity`, wrapping a bare
 //! [`TextInput`] for the typeable middle. Emits [`NumberInputEvent::Change`]
-//! whenever the value changes — by typing, stepping, or commit — so the owner
-//! never parses strings itself. Clamps to `[min, max]` and snaps to `step`.
+//! when the value is committed — a stepper press, Enter, or the field losing
+//! focus — so the owner never parses strings itself. Typing is *not* committed
+//! live: clamping each keystroke would fight a half-typed number (you could
+//! never reach `14` past a minimum of `8`). Clamps to `[min, max]` and snaps to
+//! the displayed precision.
 
 use gpui::{
     div, prelude::*, px, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
@@ -19,8 +22,8 @@ use crate::theme::ActiveTheme;
 /// Emitted when the numeric value changes, so the owner can persist it.
 #[derive(Clone, Copy, Debug)]
 pub enum NumberInputEvent {
-    /// The committed (clamped) value. Fires on each keystroke that parses, on a
-    /// stepper press, and on Enter.
+    /// The committed (clamped) value. Fires on a stepper press, on Enter, and
+    /// when the field loses focus — never mid-typing.
     Change(f64),
 }
 
@@ -33,6 +36,9 @@ pub struct NumberInput {
     step: f64,
     decimals: usize,
     _subscription: Subscription,
+    /// Installed on the first render (when a `Window` exists): commits the typed
+    /// value when the field loses focus.
+    blur_subscription: Option<Subscription>,
 }
 
 impl NumberInput {
@@ -47,13 +53,17 @@ impl NumberInput {
                 .align(TextAlign::Center)
         });
 
-        // Live-commit on every parsing keystroke and reformat on Enter. The field
-        // can't know what its number *means*, so we translate its text events into
-        // a clamped numeric value and re-emit upward.
+        // Commit is deferred, not live: clamping every keystroke would fight the
+        // user mid-number (typing "14" snaps "1" up to the minimum). Instead we
+        // only translate the text into a clamped value on Enter — and on blur,
+        // wired up in `render` once a `Window` is available. Esc discards the edit.
         let subscription = cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
-            TextInputEvent::Change => this.commit_typed(false, cx),
-            TextInputEvent::Submit => this.commit_typed(true, cx),
-            TextInputEvent::Cancel => {}
+            TextInputEvent::Submit => this.commit(cx),
+            TextInputEvent::Cancel => {
+                let value = this.value;
+                this.set_value(value, cx);
+            }
+            TextInputEvent::Change => {}
         });
 
         Self {
@@ -65,6 +75,7 @@ impl NumberInput {
             step: 1.0,
             decimals: 0,
             _subscription: subscription,
+            blur_subscription: None,
         }
     }
 
@@ -111,27 +122,25 @@ impl NumberInput {
         format!("{:.*}", self.decimals, self.value)
     }
 
-    /// Re-read the field's text. `reformat` rewrites it to the canonical form
-    /// (used on Enter); while typing we leave the raw text so the cursor stays
-    /// put. Either way the clamped value is stored and broadcast.
-    fn commit_typed(&mut self, reformat: bool, cx: &mut Context<Self>) {
+    /// Parse the field's current text, clamp it, rewrite the field to the
+    /// canonical form, and broadcast the value. Called on Enter and on blur.
+    /// Junk or out-of-range text ("", "-", "1.") snaps back to the last good
+    /// value. Only emits when the value actually changed, so a blur with no edit
+    /// (or a re-commit of the same number) stays quiet.
+    fn commit(&mut self, cx: &mut Context<Self>) {
         let raw = self.input.read(cx).content();
-        let Ok(parsed) = raw.trim().parse::<f64>() else {
-            // Mid-edit junk ("", "-", "1.") — wait for more input. On Enter,
-            // snap back to the last good value.
-            if reformat {
-                self.set_value(self.value, cx);
-            }
-            return;
-        };
-        let normalized = self.normalize(parsed);
-        self.value = normalized;
-        if reformat {
-            let text = self.format();
-            self.input
-                .update(cx, |input, cx| input.set_content(text, cx));
+        let parsed = raw.trim().parse::<f64>().ok();
+        let next = parsed.map(|v| self.normalize(v)).unwrap_or(self.value);
+        let changed = next != self.value;
+        self.value = next;
+        // Always reformat: even when the value is unchanged, the field may hold
+        // raw text ("08", "14.") that should settle to canonical form.
+        let text = self.format();
+        self.input
+            .update(cx, |input, cx| input.set_content(text, cx));
+        if changed {
+            cx.emit(NumberInputEvent::Change(next));
         }
-        cx.emit(NumberInputEvent::Change(normalized));
         cx.notify();
     }
 
@@ -162,6 +171,14 @@ impl Render for NumberInput {
         let theme = cx.theme().clone();
         let focused = self.focus_handle(cx).is_focused(window);
         let step = self.step;
+
+        // Commit-on-blur needs a Window, so it can't be set up in `new`; install it
+        // the first time we render (the handle exists by then). Held in `self`, so
+        // it lives as long as the component.
+        if self.blur_subscription.is_none() {
+            let handle = self.focus_handle(cx);
+            self.blur_subscription = Some(cx.on_blur(&handle, window, |this, _, cx| this.commit(cx)));
+        }
 
         // One stepper button: a square, full-height tap target that brightens on
         // hover. `glyph` is "−" / "+"; `delta` its signed step.
