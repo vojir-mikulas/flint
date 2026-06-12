@@ -727,21 +727,19 @@ impl<D: 'static> RenderOnce for Table<D> {
                     )
                 });
 
-                let on_select = on_select.clone();
-                let on_secondary = on_secondary.clone();
-                let on_activate = on_activate.clone();
-                let on_row_drop = on_row_drop.clone();
-                let on_row_drop_item = on_row_drop_item.clone();
-                let on_row_drag = on_row_drag.clone();
-                let drag_preview = drag_preview.clone();
-                let on_row_bounds = on_row_bounds.clone();
+                // Only *test* the handlers here (borrow, no refcount bump); each
+                // is cloned into its `'static` event closure below, and only when
+                // the guard that consumes it actually fires. A non-interactive row
+                // (the common scrolling case) clones nothing. The `is_some()` check
+                // leads each `&&` so a `None` handler skips the per-row predicate
+                // call entirely.
                 let clickable = on_select.is_some() || on_activate.is_some();
                 let is_droppable =
-                    droppable_rows.as_ref().is_some_and(|f| f(ix)) && on_row_drop.is_some();
+                    on_row_drop.is_some() && droppable_rows.as_ref().is_some_and(|f| f(ix));
                 let is_droppable_item =
-                    droppable_rows.as_ref().is_some_and(|f| f(ix)) && on_row_drop_item.is_some();
+                    on_row_drop_item.is_some() && droppable_rows.as_ref().is_some_and(|f| f(ix));
                 let is_draggable =
-                    draggable_rows.as_ref().is_some_and(|f| f(ix)) && on_row_drag.is_some();
+                    on_row_drag.is_some() && draggable_rows.as_ref().is_some_and(|f| f(ix));
                 rows.push(
                     div()
                         .id(ix)
@@ -764,6 +762,8 @@ impl<D: 'static> RenderOnce for Table<D> {
                             this.cursor_pointer()
                         })
                         .when(clickable, |this| {
+                            let on_select = on_select.clone();
+                            let on_activate = on_activate.clone();
                             this.on_click(move |event, window, cx| {
                                 if event.click_count() >= 2 {
                                     if let Some(on_activate) = on_activate.as_ref() {
@@ -776,7 +776,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                                 }
                             })
                         })
-                        .when_some(on_secondary, |this, on_secondary| {
+                        .when_some(on_secondary.clone(), |this, on_secondary| {
                             this.on_mouse_down(MouseButton::Right, move |event, window, cx| {
                                 on_secondary(ix, event.position, window, cx);
                             })
@@ -784,7 +784,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                         .when(is_droppable, |this| {
                             let this = this
                                 .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(drop_highlight));
-                            this.when_some(on_row_drop, |this, on_row_drop| {
+                            this.when_some(on_row_drop.clone(), |this, on_row_drop| {
                                 this.on_drop::<ExternalPaths>(move |paths, window, cx| {
                                     on_row_drop(ix, paths, window, cx);
                                 })
@@ -794,7 +794,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                         // this folder), highlighting the same as an external drop.
                         .when(is_droppable_item, |this| {
                             let this = this.drag_over::<D>(move |s, _, _, _| s.bg(drop_highlight));
-                            this.when_some(on_row_drop_item, |this, on_row_drop_item| {
+                            this.when_some(on_row_drop_item.clone(), |this, on_row_drop_item| {
                                 this.on_drop::<D>(move |value, window, cx| {
                                     on_row_drop_item(ix, value, window, cx);
                                 })
@@ -836,7 +836,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                         .children(laid_out)
                         // An overlay canvas reports the row's painted rect (it has
                         // no hitbox, so it doesn't intercept clicks or drops).
-                        .when_some(on_row_bounds, |this, cb| {
+                        .when_some(on_row_bounds.clone(), |this, cb| {
                             this.relative().child(
                                 canvas(
                                     |_bounds, _window, _cx| (),
