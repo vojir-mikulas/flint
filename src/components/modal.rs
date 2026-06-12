@@ -144,8 +144,10 @@ impl RenderOnce for Modal {
                         .hover(|s| s.bg(theme.bg_hover).text_color(theme.text))
                         .child("✕")
                         .when_some(close, |this, close| {
-                            // Focusable so Tab reaches it and Enter/Space close.
-                            this.tab_index(0)
+                            // Focusable so Tab reaches it, but `tab_index(1)` keeps
+                            // it last in the ring — the close ✕ must never be a
+                            // modal's initial focus (the first field/button is).
+                            this.tab_index(1)
                                 .focus(|s| s.bg(theme.bg_hover).text_color(theme.text))
                                 .on_click(move |_, window, cx| close(window, cx))
                         }),
@@ -218,19 +220,21 @@ impl RenderOnce for Modal {
                     // from escaping to the backdrop is the caller's to install).
                     .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
                     .on_action(|_: &FocusPrev, window, cx| window.focus_prev(cx))
-                    .on_key_down(move |event, window, cx| match event.keystroke.key.as_str() {
-                        "escape" => {
-                            if let Some(close) = key_close.as_ref() {
-                                close(window, cx);
+                    .on_key_down(
+                        move |event, window, cx| match event.keystroke.key.as_str() {
+                            "escape" => {
+                                if let Some(close) = key_close.as_ref() {
+                                    close(window, cx);
+                                }
                             }
-                        }
-                        "enter" => {
-                            if let Some(confirm) = key_confirm.as_ref() {
-                                confirm(window, cx);
+                            "enter" => {
+                                if let Some(confirm) = key_confirm.as_ref() {
+                                    confirm(window, cx);
+                                }
                             }
-                        }
-                        _ => {}
-                    })
+                            _ => {}
+                        },
+                    )
             })
             .when_some(on_close, |this, close| {
                 this.on_mouse_down(MouseButton::Left, move |_, window, cx| close(window, cx))

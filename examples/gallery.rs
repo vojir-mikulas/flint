@@ -110,6 +110,9 @@ struct Gallery {
 
     // --- Switcher demo: Zed-style connection switcher (trigger + popover) ---
     switcher: Entity<Switcher>,
+
+    // --- ComboBox demo: a searchable single-select dropdown ---
+    combo: Entity<ComboBox>,
 }
 
 impl Gallery {
@@ -223,6 +226,37 @@ impl Gallery {
         })
         .detach();
 
+        // A searchable single-select dropdown, seeded with a long-ish list so the
+        // embedded search field earns its keep.
+        let combo = cx.new(|cx| {
+            let mut c = ComboBox::new("demo-combo", cx);
+            c.set_placeholder("Pick a font…", cx);
+            c.set_search_placeholder("Search fonts…", cx);
+            let fonts = [
+                "Berkeley Mono",
+                "Cascadia Code",
+                "Fira Code",
+                "Hack",
+                "IBM Plex Mono",
+                "Iosevka",
+                "JetBrains Mono",
+                "Menlo",
+                "Monaspace Neon",
+                "SF Mono",
+                "Source Code Pro",
+                "Victor Mono",
+            ];
+            c.set_options(fonts.iter().map(|s| (*s).into()).collect(), Some(6), cx);
+            c
+        });
+        cx.subscribe(&combo, |this, _, event: &ComboBoxEvent, cx| {
+            if let ComboBoxEvent::Select(label) = event {
+                this.last_command = Some(format!("chose {label:?}").into());
+            }
+            cx.notify();
+        })
+        .detach();
+
         Self {
             name_input: cx.new(|cx| TextInput::new(cx).with_content("Production")),
             host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("sftp.example.com")),
@@ -249,6 +283,7 @@ impl Gallery {
             prompt_open: false,
             last_command: None,
             switcher,
+            combo,
             row_menu: None,
             drag_items: vec![
                 DragItem {
@@ -1377,6 +1412,11 @@ impl Render for Gallery {
                 self.switcher.clone(),
                 cx,
             ))
+            .child(self.section(
+                "ComboBox (searchable single-select dropdown)",
+                self.combo.clone(),
+                cx,
+            ))
             .child(self.section("Number input", number_input, cx))
             .child(self.section("Context menu", context_menu, cx))
             .child(self.section("Toasts", toasts, cx))
@@ -1594,6 +1634,7 @@ fn main() {
         CodeEditor::bind_keys(cx);
         Palette::bind_keys(cx);
         Switcher::bind_keys(cx);
+        ComboBox::bind_keys(cx);
 
         // Kick off generation of the 2M-row SQLite table for spike A so it's
         // ready by the time anyone switches the streaming grid to it.

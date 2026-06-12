@@ -23,6 +23,7 @@ pub use components::button::{Button, ButtonSize, ButtonVariant};
 pub use components::code_editor::{
     CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
 };
+pub use components::combo_box::{ComboBox, ComboBoxEvent};
 pub use components::context_menu::{ContextMenu, ContextMenuItem};
 pub use components::floating::{floating, Floating};
 pub use components::icon_button::{IconButton, IconButtonSize};
@@ -34,7 +35,9 @@ pub use components::scrollbar::{Scrollbar, ScrollbarState};
 pub use components::segmented::Segmented;
 pub use components::select::Select;
 pub use components::split_pane::{DragAnchor, SplitPane};
-pub use components::switcher::{Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection};
+pub use components::switcher::{
+    Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection,
+};
 pub use components::table::{CellRange, Column, ColumnAlign, ColumnWidth, Table, TableNav};
 pub use components::tabs::Tabs;
 pub use components::text_input::{TextInput, TextInputEvent};
@@ -52,6 +55,7 @@ pub mod prelude {
     pub use crate::components::code_editor::{
         CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
     };
+    pub use crate::components::combo_box::{ComboBox, ComboBoxEvent};
     pub use crate::components::context_menu::{ContextMenu, ContextMenuItem};
     pub use crate::components::floating::{floating, Floating};
     pub use crate::components::icon_button::{IconButton, IconButtonSize};
