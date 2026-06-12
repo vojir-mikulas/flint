@@ -65,8 +65,9 @@ struct Gallery {
     segment: usize,
     select: usize,
     select_open: bool,
-    /// The right-clicked row + cursor position for the secondary-click table demo.
-    row_menu: Option<(usize, Point<Pixels>)>,
+    /// The right-clicked (row, column) + cursor position for the secondary-click
+    /// table demo (exercises `Table::on_cell_secondary`).
+    row_menu: Option<(usize, usize, Point<Pixels>)>,
     /// Backing list for the in-app drag-to-folder table demo.
     drag_items: Vec<DragItem>,
 
@@ -339,8 +340,9 @@ impl Gallery {
         }
     }
 
-    /// Nested resizable split: a sidebar (horizontal) wrapping a stacked
-    /// editor/results pair (vertical). Drag either divider to resize.
+    /// Nested resizable split: a leading-sized sidebar (horizontal) wrapping a
+    /// stacked editor/results pair (vertical) whose *trailing* pane is the sized
+    /// one — a bottom-docked panel. Drag either divider to resize.
     fn split_pane(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (bg_left, bg_top, bg_bottom) = (theme.bg_panel_2, theme.bg_app, theme.bg_panel);
@@ -360,6 +362,7 @@ impl Gallery {
         };
 
         let inner = SplitPane::new("gallery-split-v", Axis::Vertical)
+            .sized(SplitSide::Trailing)
             .size(self.split_v_size)
             .drag(self.split_v_drag)
             .min_first(px(48.))
@@ -822,7 +825,8 @@ impl Gallery {
     }
 
     /// A table whose **right-click** opens a `ContextMenu` anchored at the cursor,
-    /// exercising `Table::on_secondary` (index + position, no domain types).
+    /// exercising `Table::on_cell_secondary` (row + column + position, no domain
+    /// types) so the menu can name the exact cell that was clicked.
     fn secondary_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let theme = cx.theme();
@@ -844,11 +848,11 @@ impl Gallery {
                     ],
                 )
                 .row_count(ROWS.len())
-                .on_secondary({
+                .on_cell_secondary({
                     let view = view.clone();
-                    move |ix, pos, _window, cx| {
+                    move |ix, col, pos, _window, cx| {
                         view.update(cx, |this, cx| {
-                            this.row_menu = Some((ix, pos));
+                            this.row_menu = Some((ix, col, pos));
                             cx.notify();
                         });
                     }
@@ -869,12 +873,13 @@ impl Gallery {
         div()
             .relative()
             .child(table)
-            .when_some(self.row_menu, |this, (ix, pos)| {
+            .when_some(self.row_menu, |this, (ix, col, pos)| {
                 let name = ROWS[ix].0;
+                let field = if col == 0 { "name" } else { "size" };
                 let menu = ContextMenu::new("secondary-ctx")
                     .item(ContextMenuItem::new(
                         "s-download",
-                        format!("Download {name}"),
+                        format!("Download {name} ({field})"),
                     ))
                     .item(ContextMenuItem::new("s-rename", "Rename"))
                     .separator()

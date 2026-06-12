@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `SplitPane` - a two-pane resizable split. Stateless [`RenderOnce`]: the
-//! consumer owns the leading pane's size and the in-flight drag anchor (GPUI
+//! consumer owns the sized pane's size and the in-flight drag anchor (GPUI
 //! recreates elements each frame, so persistent state can't live here), exactly
 //! as [`crate::Table`] leaves selection to the caller.
 //!
-//! The leading pane is sized in pixels; the trailing pane flexes to fill the
-//! rest. Dragging the divider reports a new pixel size via `on_resize`. While a
+//! One pane is sized in pixels; the other flexes to fill the rest. By default the
+//! leading pane is the sized one; [`SplitPane::sized`] with [`SplitSide::Trailing`]
+//! instead pins the trailing pane (for right/bottom-docked panels). Dragging the
+//! divider reports a new pixel size for the sized pane via `on_resize`. While a
 //! drag is in flight (`drag` is `Some`), the pane renders a full-cover overlay so
 //! mouse moves are tracked even when the cursor leaves the thin divider.
 
@@ -28,6 +30,17 @@ pub struct DragAnchor {
     pub start_size: Pixels,
 }
 
+/// Which pane carries the explicit pixel `size` — the other one flexes to fill
+/// the rest. `min_first`/`max_first` bound whichever pane is sized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SplitSide {
+    /// The leading pane (left in `Horizontal`, top in `Vertical`) is sized.
+    #[default]
+    Leading,
+    /// The trailing pane (right/bottom) is sized — for docked side panels.
+    Trailing,
+}
+
 type ResizeHandler = Rc<dyn Fn(Pixels, &mut Window, &mut App)>;
 type DragStartHandler = Rc<dyn Fn(DragAnchor, &mut Window, &mut App)>;
 type DragEndHandler = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -38,6 +51,8 @@ pub struct SplitPane {
     /// The axis the divider moves along: `Horizontal` = side-by-side panes,
     /// `Vertical` = stacked panes.
     axis: Axis,
+    /// Which pane the `size`/`min_first`/`max_first` apply to.
+    side: SplitSide,
     size: Pixels,
     min_first: Pixels,
     max_first: Option<Pixels>,
@@ -54,6 +69,7 @@ impl SplitPane {
         Self {
             id: id.into(),
             axis,
+            side: SplitSide::Leading,
             size: px(280.),
             min_first: px(80.),
             max_first: None,
@@ -66,7 +82,13 @@ impl SplitPane {
         }
     }
 
-    /// Current size of the leading pane (caller-owned state).
+    /// Which pane carries the explicit pixel size (default [`SplitSide::Leading`]).
+    pub fn sized(mut self, side: SplitSide) -> Self {
+        self.side = side;
+        self
+    }
+
+    /// Current size of the sized pane (caller-owned state).
     pub fn size(mut self, size: Pixels) -> Self {
         self.size = size;
         self
@@ -133,6 +155,7 @@ impl RenderOnce for SplitPane {
         let theme = cx.theme();
         let axis = self.axis;
         let horizontal = axis == Axis::Horizontal;
+        let trailing = self.side == SplitSide::Trailing;
         let size = self.clamp(self.size);
         // A calm 1px separator centered in a wider grab gutter; the line picks up
         // the accent while the gutter is hovered (so the whole strip is grabbable
@@ -140,19 +163,29 @@ impl RenderOnce for SplitPane {
         let line_color = theme.border;
         let line_hover = theme.accent;
 
-        let first = div()
-            .flex_shrink_0()
-            .overflow_hidden()
-            .when(horizontal, |s| s.w(size).h_full())
-            .when(!horizontal, |s| s.h(size).w_full())
-            .children(self.first);
-
-        let second = div()
-            .flex_1()
-            .overflow_hidden()
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .children(self.second);
+        // The sized pane gets the fixed pixel size; the other flexes. `trailing`
+        // swaps which is which without moving the panes (first stays left/top).
+        let sized = |children| {
+            div()
+                .flex_shrink_0()
+                .overflow_hidden()
+                .when(horizontal, |s| s.w(size).h_full())
+                .when(!horizontal, |s| s.h(size).w_full())
+                .children(children)
+        };
+        let flexed = |children| {
+            div()
+                .flex_1()
+                .overflow_hidden()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .children(children)
+        };
+        let (first, second) = if trailing {
+            (flexed(self.first), sized(self.second))
+        } else {
+            (sized(self.first), flexed(self.second))
+        };
 
         // Thin draggable gutter; press captures a drag anchor for the overlay.
         let cur_size = self.size;
@@ -216,7 +249,13 @@ impl RenderOnce for SplitPane {
                     .when_some(on_resize, |this, handler| {
                         this.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
                             let delta = event.position.along(axis) - anchor.start_coord;
-                            let raw = anchor.start_size + delta;
+                            // Dragging toward the trailing pane shrinks it, so the
+                            // delta is subtracted when that's the sized one.
+                            let raw = if trailing {
+                                anchor.start_size - delta
+                            } else {
+                                anchor.start_size + delta
+                            };
                             let lo = f32::from(min_first);
                             let hi = max_first.map(f32::from).unwrap_or(f32::MAX);
                             handler(px(f32::from(raw).clamp(lo, hi.max(lo))), window, cx);

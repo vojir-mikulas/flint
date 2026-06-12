@@ -16,8 +16,8 @@
 //! [`Switcher`](super::switcher::Switcher).
 
 use gpui::{
-    actions, canvas, div, point, prelude::*, px, App, Bounds, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, KeyBinding, Pixels, SharedString, Window,
+    actions, canvas, div, point, prelude::*, px, AnyElement, App, Bounds, Context, Entity,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, Pixels, SharedString, Window,
 };
 
 use crate::components::floating::floating;
@@ -26,6 +26,11 @@ use crate::components::text_input::{TextInput, TextInputEvent};
 use crate::theme::ActiveTheme;
 
 actions!(flint_combo_box, [SelectNext, SelectPrev]);
+
+/// A glyph factory, re-invoked each render so the icon re-themes with the app
+/// (size/colour follow the current theme). Caller-supplied so Flint stays
+/// domain-free — RED hands in its lucide SVGs, the gallery a unicode mark.
+type IconFn = Box<dyn Fn(&App) -> AnyElement + 'static>;
 
 /// What the owner subscribes to via `cx.subscribe`.
 #[derive(Clone, Debug)]
@@ -60,6 +65,10 @@ pub struct ComboBox {
     needs_focus: bool,
     /// Trigger text shown when `current` is `None`.
     placeholder: SharedString,
+    /// Trigger disclosure glyph; falls back to a stacked unicode chevron.
+    chevron: Option<IconFn>,
+    /// Mark on the selected row; falls back to a unicode check.
+    check: Option<IconFn>,
 }
 
 impl ComboBox {
@@ -92,6 +101,8 @@ impl ComboBox {
             open: false,
             needs_focus: false,
             placeholder: "Select…".into(),
+            chevron: None,
+            check: None,
         }
     }
 
@@ -126,6 +137,28 @@ impl ComboBox {
     ) {
         self.input
             .update(cx, |input, cx| input.set_placeholder(text, cx));
+    }
+
+    /// Disclosure glyph for the trigger, as a factory re-invoked each render so it
+    /// re-themes with the app. Falls back to a stacked unicode chevron when unset.
+    pub fn set_chevron(
+        &mut self,
+        make: impl Fn(&App) -> AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.chevron = Some(Box::new(make));
+        cx.notify();
+    }
+
+    /// Mark drawn on the selected row, as a per-render factory. Falls back to a
+    /// unicode check when unset.
+    pub fn set_check(
+        &mut self,
+        make: impl Fn(&App) -> AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.check = Some(Box::new(make));
+        cx.notify();
     }
 
     /// Replace the option list and the current selection, then re-filter against
@@ -262,6 +295,20 @@ impl Render for ComboBox {
             .current
             .and_then(|ix| self.options.get(ix).cloned())
             .unwrap_or_else(|| self.placeholder.clone());
+        // Caller's disclosure glyph (lucide chevron), else a stacked unicode mark.
+        let chevron = match self.chevron.as_ref() {
+            Some(make) => make(cx),
+            None => div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .text_color(theme.accent)
+                .text_size(theme.font_size_micro())
+                .line_height(px(6.))
+                .child("⌃")
+                .child("⌄")
+                .into_any_element(),
+        };
         let trigger = div()
             .id(self.id.clone())
             .flex()
@@ -277,26 +324,17 @@ impl Render for ComboBox {
             } else {
                 theme.border
             })
-            .text_size(theme.font_size)
-            .font_weight(FontWeight::MEDIUM)
+            .text_size(theme.font_size_sm())
+            // The selected value reads in the normal foreground (not the accent) —
+            // on a strongly-accented theme an accent-coloured value glows.
             .text_color(if has_selection {
-                theme.accent
+                theme.text
             } else {
                 theme.text_faint
             })
             .cursor_pointer()
             .child(div().child(current_label))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .text_color(theme.accent)
-                    .text_size(theme.font_size_micro())
-                    .line_height(px(6.))
-                    .child("⌃")
-                    .child("⌄"),
-            )
+            .child(chevron)
             .child(
                 // Invisible overlay recording the trigger's window bounds so the
                 // popover can anchor to its bottom-left. Re-renders only on change.
@@ -326,11 +364,24 @@ impl Render for ComboBox {
         let accent = theme.accent;
         let bg_selected = theme.bg_selected;
         let bg_hover = theme.bg_hover;
-        let font_base = theme.font_size;
         let font_sm = theme.font_size_sm();
         let view = cx.entity().downgrade();
         let cursor = self.cursor;
         let current = self.current;
+
+        // The single check for the active row (only one option is `current`): the
+        // caller's lucide check when set, else a unicode mark. Built once and moved
+        // into whichever filtered row is current.
+        let mut active_check: Option<AnyElement> =
+            self.current.map(|_| match self.check.as_ref() {
+                Some(make) => make(cx),
+                None => div()
+                    .flex_none()
+                    .text_size(font_sm)
+                    .text_color(accent)
+                    .child("✓")
+                    .into_any_element(),
+            });
 
         let rows: Vec<_> = self
             .filtered
@@ -340,13 +391,7 @@ impl Render for ComboBox {
                 let is_cursor = row_ix == cursor;
                 let is_current = Some(f.option) == current;
                 let view = view.clone();
-                let check = is_current.then(|| {
-                    div()
-                        .flex_none()
-                        .text_size(font_sm)
-                        .text_color(accent)
-                        .child("✓")
-                });
+                let check = is_current.then(|| active_check.take()).flatten();
                 div()
                     .id(("combo-row", row_ix))
                     .flex()
@@ -375,7 +420,7 @@ impl Render for ComboBox {
             div()
                 .p(px(18.))
                 .text_center()
-                .text_size(font_base)
+                .text_size(font_sm)
                 .text_color(text_faint)
                 .child("No matches")
                 .into_any_element()
@@ -399,7 +444,7 @@ impl Render for ComboBox {
             .py(px(9.))
             .border_b_1()
             .border_color(theme.border_soft)
-            .text_size(font_base)
+            .text_size(font_sm)
             .child(self.input.clone());
 
         let panel = div()
@@ -409,7 +454,7 @@ impl Render for ComboBox {
             .flex_col()
             .min_w(px(240.))
             .font_family(theme.font_family.clone())
-            .text_size(font_base)
+            .text_size(font_sm)
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_strong)

@@ -162,6 +162,10 @@ type RowClickHandler = Box<dyn Fn(usize, &ClickEvent, &mut Window, &mut App) + '
 type CellClickHandler = Rc<dyn Fn(usize, usize, &ClickEvent, &mut Window, &mut App) + 'static>;
 /// Receives the row index and cursor position, to anchor a context menu.
 type RowSecondaryHandler = Box<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static>;
+/// Cell-level right-click `(row, col, position)`, to anchor a per-cell context
+/// menu — the cell-grained counterpart to [`RowSecondaryHandler`].
+type CellSecondaryHandler =
+    Rc<dyn Fn(usize, usize, Point<Pixels>, &mut Window, &mut App) + 'static>;
 /// Builds one cell [`AnyElement`] per column for a row.
 type RowRenderer = Rc<dyn Fn(usize, &mut Window, &mut App) -> Vec<gpui::AnyElement> + 'static>;
 /// Builds the sort caret. Returns an [`AnyElement`] so the library stays
@@ -233,6 +237,7 @@ pub struct Table<D: 'static = ()> {
     on_visible_range: Option<VisibleRangeHandler>,
     selected_cells: Option<CellRange>,
     on_cell_click: Option<CellClickHandler>,
+    on_cell_secondary: Option<CellSecondaryHandler>,
     focus_handle: Option<FocusHandle>,
     on_nav: Option<NavHandler>,
     horizontal: bool,
@@ -278,6 +283,7 @@ impl<D: 'static> Table<D> {
             on_visible_range: None,
             selected_cells: None,
             on_cell_click: None,
+            on_cell_secondary: None,
             focus_handle: None,
             on_nav: None,
             horizontal: false,
@@ -319,6 +325,17 @@ impl<D: 'static> Table<D> {
         handler: impl Fn(usize, usize, &ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_cell_click = Some(Rc::new(handler));
+        self
+    }
+
+    /// Per-cell right-click handler `(row, col, position)` — anchors a per-cell
+    /// context menu. Fires on right mouse-down; the caller typically selects the
+    /// cell and stashes the position to anchor a [`crate::ContextMenu`].
+    pub fn on_cell_secondary(
+        mut self,
+        handler: impl Fn(usize, usize, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_cell_secondary = Some(Rc::new(handler));
         self
     }
 
@@ -664,6 +681,7 @@ impl<D: 'static> RenderOnce for Table<D> {
 
         let selected_cells = self.selected_cells;
         let on_cell_click = self.on_cell_click.clone();
+        let on_cell_secondary = self.on_cell_secondary.clone();
         let focus_handle = self.focus_handle.clone();
         let on_nav = self.on_nav.clone();
 
@@ -698,6 +716,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                     let is_cell_selected =
                         selected_cells.is_some_and(|range| range.contains(ix, c));
                     let on_cell_click = on_cell_click.clone();
+                    let on_cell_secondary = on_cell_secondary.clone();
                     cell_layout(
                         div()
                             // A stable, allocation-free per-cell id: `(row, col)`
@@ -719,6 +738,11 @@ impl<D: 'static> RenderOnce for Table<D> {
                             .when_some(on_cell_click, |d, handler| {
                                 d.cursor_pointer().on_click(move |event, window, cx| {
                                     handler(ix, c, event, window, cx)
+                                })
+                            })
+                            .when_some(on_cell_secondary, |d, handler| {
+                                d.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                    handler(ix, c, event.position, window, cx)
                                 })
                             })
                             .child(cell),

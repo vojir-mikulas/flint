@@ -27,6 +27,10 @@ use crate::theme::ActiveTheme;
 
 actions!(flint_switcher, [SelectNext, SelectPrev]);
 
+/// A glyph factory, re-invoked each render so the icon re-themes with the app.
+/// Caller-supplied so Flint stays domain-free (RED hands in its lucide SVGs).
+type IconFn = Box<dyn Fn(&App) -> AnyElement + 'static>;
+
 /// A small pill drawn on the right of a row, e.g. a connection's warm/cold state.
 #[derive(Clone, Debug)]
 pub struct SwitcherBadge {
@@ -148,6 +152,8 @@ pub struct Switcher {
     /// Trigger label and its leading dot (e.g. the active connection).
     trigger_label: SharedString,
     trigger_dot: Option<Hsla>,
+    /// Trigger disclosure glyph; falls back to a unicode chevron when unset.
+    chevron: Option<IconFn>,
 }
 
 impl Switcher {
@@ -181,6 +187,7 @@ impl Switcher {
             needs_focus: false,
             trigger_label: "Switch…".into(),
             trigger_dot: None,
+            chevron: None,
         }
     }
 
@@ -216,6 +223,17 @@ impl Switcher {
     pub fn set_placeholder(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.input
             .update(cx, |input, cx| input.set_placeholder(text, cx));
+    }
+
+    /// Disclosure glyph for the trigger, as a factory re-invoked each render so it
+    /// re-themes with the app. Falls back to a unicode chevron when unset.
+    pub fn set_chevron(
+        &mut self,
+        make: impl Fn(&App) -> AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.chevron = Some(Box::new(make));
+        cx.notify();
     }
 
     /// Replace the popover contents and re-filter against the current query.
@@ -360,8 +378,22 @@ impl Render for Switcher {
                 .bg(c)
                 .into_any_element()
         });
+        // Caller's disclosure glyph (lucide chevron), else a unicode mark. Wrapped
+        // in a centred flex box so it sits on the trigger's vertical midline.
+        let chevron = match self.chevron.as_ref() {
+            Some(make) => make(cx),
+            None => div()
+                .text_size(theme.font_size_xs())
+                .text_color(theme.text_dim)
+                .child("⌄")
+                .into_any_element(),
+        };
         let trigger = div()
             .id(self.id.clone())
+            // Swallow mouse events so the trigger doesn't double as its host's
+            // window-drag region — without this a double-tap on the trigger also
+            // hits a titlebar drag area behind it and zooms the window.
+            .occlude()
             .flex()
             .items_center()
             .gap_1p5()
@@ -380,12 +412,7 @@ impl Render for Switcher {
             .cursor_pointer()
             .when_some(dot, |this, dot| this.child(dot))
             .child(div().child(self.trigger_label.clone()))
-            .child(
-                div()
-                    .text_size(theme.font_size_xs())
-                    .text_color(theme.text_dim)
-                    .child("⌄"),
-            )
+            .child(div().flex().items_center().child(chevron))
             .child(
                 canvas(
                     move |bounds, _, cx| {
