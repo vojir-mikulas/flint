@@ -203,10 +203,13 @@ impl Gallery {
                                 .badge(SwitcherBadge::new("cold", dim)),
                         ],
                     ),
-                    SwitcherSection::untitled(vec![
-                        SwitcherItem::new("action:new", "New connection…"),
-                        SwitcherItem::new("action:manage", "Manage connections…"),
-                    ]),
+                ],
+                cx,
+            );
+            s.set_footer(
+                vec![
+                    SwitcherItem::new("action:new", "New connection…"),
+                    SwitcherItem::new("action:manage", "Manage connections…"),
                 ],
                 cx,
             );

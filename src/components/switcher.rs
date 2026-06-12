@@ -135,7 +135,12 @@ pub struct Switcher {
     focus_handle: FocusHandle,
     input: Entity<TextInput>,
     sections: Vec<SwitcherSection>,
+    /// Pinned action rows, rendered below the scrollable list and always
+    /// visible (exempt from the search filter) — e.g. "New…" / "Manage…".
+    footer: Vec<SwitcherItem>,
     filtered: Vec<Filtered>,
+    /// Selection index over the combined navigable space: the `filtered` list
+    /// rows first, then the `footer` rows.
     selected: usize,
     open: bool,
     /// Focus the search field on the next paint (set when opening).
@@ -169,6 +174,7 @@ impl Switcher {
             focus_handle: cx.focus_handle(),
             input,
             sections: Vec::new(),
+            footer: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
             open: false,
@@ -215,6 +221,14 @@ impl Switcher {
     /// Replace the popover contents and re-filter against the current query.
     pub fn set_sections(&mut self, sections: Vec<SwitcherSection>, cx: &mut Context<Self>) {
         self.sections = sections;
+        self.refilter(cx);
+        cx.notify();
+    }
+
+    /// Set the pinned footer rows — always-visible actions shown beneath the
+    /// scrollable list and unaffected by the search query (e.g. "New…").
+    pub fn set_footer(&mut self, items: Vec<SwitcherItem>, cx: &mut Context<Self>) {
+        self.footer = items;
         self.refilter(cx);
         cx.notify();
     }
@@ -270,23 +284,37 @@ impl Switcher {
         self.selected = 0;
     }
 
+    /// Count of navigable rows: filtered list rows plus the pinned footer.
+    fn nav_len(&self) -> usize {
+        self.filtered.len() + self.footer.len()
+    }
+
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.filtered.is_empty() {
-            self.selected = (self.selected + 1) % self.filtered.len();
+        let len = self.nav_len();
+        if len != 0 {
+            self.selected = (self.selected + 1) % len;
             cx.notify();
         }
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.filtered.is_empty() {
-            self.selected = (self.selected + self.filtered.len() - 1) % self.filtered.len();
+        let len = self.nav_len();
+        if len != 0 {
+            self.selected = (self.selected + len - 1) % len;
             cx.notify();
         }
     }
 
     fn activate(&mut self, flat_ix: usize, cx: &mut Context<Self>) {
-        if let Some(f) = self.filtered.get(flat_ix) {
-            let id = self.sections[f.section].items[f.item].id.clone();
+        // Indices past the filtered list address the pinned footer rows.
+        let id = if let Some(f) = self.filtered.get(flat_ix) {
+            Some(self.sections[f.section].items[f.item].id.clone())
+        } else {
+            self.footer
+                .get(flat_ix - self.filtered.len())
+                .map(|item| item.id.clone())
+        };
+        if let Some(id) = id {
             self.open = false;
             cx.emit(SwitcherEvent::Activate(id));
             cx.notify();
@@ -392,26 +420,10 @@ impl Render for Switcher {
         let view = cx.entity().downgrade();
         let selected = self.selected;
 
-        let mut rows: Vec<AnyElement> = Vec::new();
-        let mut last_section: Option<usize> = None;
-        for (flat_ix, f) in self.filtered.iter().enumerate() {
-            if last_section != Some(f.section) {
-                last_section = Some(f.section);
-                if let Some(title) = &self.sections[f.section].title {
-                    rows.push(
-                        div()
-                            .px(px(10.))
-                            .pt(px(if flat_ix == 0 { 2. } else { 8. }))
-                            .pb(px(3.))
-                            .text_size(micro)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(text_faint)
-                            .child(title.to_uppercase())
-                            .into_any_element(),
-                    );
-                }
-            }
-            let item = &self.sections[f.section].items[f.item];
+        // Renders one selectable row. Shared by the scrollable list and the
+        // pinned footer so both look and behave identically; `flat_ix` is the
+        // row's index in the combined navigable space (see `activate`).
+        let make_row = move |flat_ix: usize, item: &SwitcherItem, positions: &[usize]| {
             let is_selected = flat_ix == selected;
             let view = view.clone();
 
@@ -424,7 +436,7 @@ impl Render for Switcher {
                 .flex_col()
                 .flex_1()
                 .min_w_0()
-                .child(highlighted_label(&item.label, &f.positions, text, accent))
+                .child(highlighted_label(&item.label, positions, text, accent))
                 .when_some(item.detail.clone(), |this, detail| {
                     this.child(
                         div()
@@ -453,27 +465,48 @@ impl Render for Switcher {
                     .child("✓")
             });
 
-            rows.push(
-                div()
-                    .id(("switcher-row", flat_ix))
-                    .flex()
-                    .items_center()
-                    .gap_2p5()
-                    .px(px(10.))
-                    .py(px(6.))
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .when(is_selected, |d| d.bg(bg_selected))
-                    .when(!is_selected, |d| d.hover(move |s| s.bg(bg_hover)))
-                    .child(dot)
-                    .child(label_block)
-                    .when_some(badge, |this, badge| this.child(badge))
-                    .when_some(check, |this, check| this.child(check))
-                    .on_click(move |_, _, cx| {
-                        view.update(cx, |this, cx| this.activate(flat_ix, cx)).ok();
-                    })
-                    .into_any_element(),
-            );
+            div()
+                .id(("switcher-row", flat_ix))
+                .flex()
+                .items_center()
+                .gap_2p5()
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(is_selected, |d| d.bg(bg_selected))
+                .when(!is_selected, |d| d.hover(move |s| s.bg(bg_hover)))
+                .child(dot)
+                .child(label_block)
+                .when_some(badge, |this, badge| this.child(badge))
+                .when_some(check, |this, check| this.child(check))
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |this, cx| this.activate(flat_ix, cx)).ok();
+                })
+                .into_any_element()
+        };
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut last_section: Option<usize> = None;
+        for (flat_ix, f) in self.filtered.iter().enumerate() {
+            if last_section != Some(f.section) {
+                last_section = Some(f.section);
+                if let Some(title) = &self.sections[f.section].title {
+                    rows.push(
+                        div()
+                            .px(px(10.))
+                            .pt(px(if flat_ix == 0 { 2. } else { 8. }))
+                            .pb(px(3.))
+                            .text_size(micro)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_faint)
+                            .child(title.to_uppercase())
+                            .into_any_element(),
+                    );
+                }
+            }
+            let item = &self.sections[f.section].items[f.item];
+            rows.push(make_row(flat_ix, item, &f.positions));
         }
 
         let body = if rows.is_empty() {
@@ -496,6 +529,24 @@ impl Render for Switcher {
                 .children(rows)
                 .into_any_element()
         };
+
+        // Pinned footer: the actions stay put while the list above scrolls.
+        let footer = (!self.footer.is_empty()).then(|| {
+            let base = self.filtered.len();
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .p(px(6.))
+                .border_t_1()
+                .border_color(theme.border_soft)
+                .children(
+                    self.footer
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| make_row(base + i, item, &[])),
+                )
+        });
 
         let input_row = div()
             .flex()
@@ -527,7 +578,8 @@ impl Render for Switcher {
             .on_action(cx.listener(Self::select_prev))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss(cx)))
             .child(input_row)
-            .child(body);
+            .child(body)
+            .when_some(footer, |this, footer| this.child(footer));
 
         div()
             .child(trigger)
