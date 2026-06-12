@@ -63,7 +63,7 @@ impl RenderOnce for Badge {
             .px_1p5()
             .py(gpui::px(1.))
             .rounded(theme.radius_sm)
-            .text_xs()
+            .text_size(theme.font_size_xs())
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(fg)
             .bg(bg)

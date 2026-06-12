@@ -140,7 +140,7 @@ impl RenderOnce for Select {
                 .flex_col()
                 .items_center()
                 .text_color(theme.accent)
-                .text_size(px(9.))
+                .text_size(theme.font_size_micro())
                 .line_height(px(6.))
                 .child("⌃")
                 .child("⌄")
@@ -162,7 +162,7 @@ impl RenderOnce for Select {
             } else {
                 theme.border
             })
-            .text_sm()
+            .text_size(theme.font_size)
             .font_weight(FontWeight::MEDIUM)
             .text_color(if has_selection {
                 theme.accent
@@ -203,38 +203,46 @@ impl RenderOnce for Select {
         // check (if any) is moved onto whichever row is selected; the rest fall
         // back to a unicode mark.
         let mut check = self.check;
-        let rows = self.options.into_iter().enumerate().map(move |(ix, label)| {
-            let is_selected = ix == selected;
-            let handler = on_select.clone();
-            let mark = is_selected.then(|| {
-                check
-                    .take()
-                    .unwrap_or_else(|| div().text_xs().child("✓").into_any_element())
+        // Precompute as `Pixels` (Copy) so the `move` row closure captures the
+        // sizes disjointly rather than borrowing all of `theme`.
+        let item_size = theme.font_size_sm();
+        let mark_size = theme.font_size_xs();
+        let rows = self
+            .options
+            .into_iter()
+            .enumerate()
+            .map(move |(ix, label)| {
+                let is_selected = ix == selected;
+                let handler = on_select.clone();
+                let mark = is_selected.then(|| {
+                    check
+                        .take()
+                        .unwrap_or_else(|| div().text_size(mark_size).child("✓").into_any_element())
+                });
+                div()
+                    .id(ix)
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.))
+                    .text_size(item_size)
+                    .text_color(if is_selected {
+                        theme.accent
+                    } else {
+                        theme.text
+                    })
+                    .cursor_pointer()
+                    .tab_index(0)
+                    .focus(move |s| s.bg(theme.bg_hover).focus_ring_color(ring, glow))
+                    .hover(move |s| s.bg(theme.bg_hover))
+                    .child(div().flex_1().child(label))
+                    .when_some(mark, |this, mark| this.child(mark))
+                    .when_some(handler, |this, handler| {
+                        this.on_click(move |_, window, cx| handler(ix, window, cx))
+                    })
             });
-            div()
-                .id(ix)
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .rounded(px(4.))
-                .text_xs()
-                .text_color(if is_selected {
-                    theme.accent
-                } else {
-                    theme.text
-                })
-                .cursor_pointer()
-                .tab_index(0)
-                .focus(move |s| s.bg(theme.bg_hover).focus_ring_color(ring, glow))
-                .hover(move |s| s.bg(theme.bg_hover))
-                .child(div().flex_1().child(label))
-                .when_some(mark, |this, mark| this.child(mark))
-                .when_some(handler, |this, handler| {
-                    this.on_click(move |_, window, cx| handler(ix, window, cx))
-                })
-        });
 
         let list = div()
             .id("select-menu")
@@ -247,6 +255,8 @@ impl RenderOnce for Select {
             .max_h(px(320.))
             .overflow_y_scroll()
             .p_1()
+            .font_family(theme.font_family.clone())
+            .text_size(item_size)
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_strong)

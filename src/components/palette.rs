@@ -12,10 +12,11 @@
 
 use gpui::{
     actions, div, prelude::*, px, uniform_list, App, Context, ElementId, Entity, EventEmitter,
-    FocusHandle, Focusable, FontWeight, Hsla, KeyBinding, ScrollStrategy, SharedString,
-    UniformListScrollHandle, Window,
+    FocusHandle, Focusable, KeyBinding, ScrollStrategy, SharedString, UniformListScrollHandle,
+    Window,
 };
 
+use crate::components::fuzzy::{fuzzy_match, highlighted_label};
 use crate::components::text_input::{TextInput, TextInputEvent};
 use crate::theme::ActiveTheme;
 
@@ -250,6 +251,10 @@ impl Render for Palette {
         let accent = theme.accent;
         let border_soft = theme.border_soft;
         let bg_elevated = theme.bg_elevated;
+        let font_family = theme.font_family.clone();
+        let font_base = theme.font_size;
+        let font_lg = theme.font_size_lg();
+        let hint_size = theme.font_size_xs();
 
         let view = cx.entity().downgrade();
         let selected = self.selected;
@@ -293,7 +298,7 @@ impl Render for Palette {
                                     div()
                                         .ml_auto()
                                         .flex_shrink_0()
-                                        .text_size(px(11.))
+                                        .text_size(hint_size)
                                         .text_color(text_faint)
                                         .child(hint),
                                 )
@@ -318,7 +323,7 @@ impl Render for Palette {
             .py(px(13.))
             .border_b_1()
             .border_color(border_soft)
-            .text_size(px(15.))
+            .text_size(font_lg)
             .child(self.input.clone());
 
         let body = if self.prompt {
@@ -328,7 +333,7 @@ impl Render for Palette {
             div()
                 .p(px(22.))
                 .text_center()
-                .text_size(px(13.))
+                .text_size(font_base)
                 .text_color(text_faint)
                 .child("No matching commands")
                 .into_any_element()
@@ -353,6 +358,8 @@ impl Render for Palette {
             .flex_col()
             .w(px(560.))
             .max_w(gpui::relative(0.92))
+            .font_family(font_family)
+            .text_size(font_base)
             .bg(bg_elevated)
             .border_1()
             .border_color(border_soft)
@@ -385,159 +392,5 @@ impl Render for Palette {
                 cx.listener(|_, _, _, cx| cx.emit(PaletteEvent::Dismiss)),
             )
             .child(panel)
-    }
-}
-
-/// Render a label with its fuzzy-matched characters emphasised. Consecutive
-/// matched/unmatched runs become sibling spans in a flex row, so the matched
-/// glyphs paint in `hit` (bold) over the `base` colour.
-fn highlighted_label(
-    label: &SharedString,
-    positions: &[usize],
-    base: Hsla,
-    hit: Hsla,
-) -> impl IntoElement {
-    let mut spans: Vec<(String, bool)> = Vec::new();
-    let mut current = String::new();
-    let mut current_hit = false;
-    for (byte, ch) in label.char_indices() {
-        let is_hit = positions.contains(&byte);
-        if is_hit != current_hit && !current.is_empty() {
-            spans.push((std::mem::take(&mut current), current_hit));
-        }
-        current_hit = is_hit;
-        current.push(ch);
-    }
-    if !current.is_empty() {
-        spans.push((current, current_hit));
-    }
-
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .children(spans.into_iter().map(move |(segment, is_hit)| {
-            div()
-                .when(is_hit, |d| d.font_weight(FontWeight::SEMIBOLD))
-                .text_color(if is_hit { hit } else { base })
-                .child(segment)
-        }))
-}
-
-/// Case-insensitive subsequence fuzzy match of `query` against `text`. Returns
-/// `None` unless every (non-whitespace) query char appears in order. On a match,
-/// returns a score (higher = better) and the byte offsets in `text` that matched,
-/// for highlighting. An empty query matches everything with score 0 and no marks,
-/// so the list shows in its natural order.
-fn fuzzy_match(query: &str, text: &str) -> Option<(i32, Vec<usize>)> {
-    let needles: Vec<char> = query
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(|c| c.to_lowercase())
-        .collect();
-    if needles.is_empty() {
-        return Some((0, Vec::new()));
-    }
-
-    let haystack: Vec<(usize, char)> = text.char_indices().collect();
-    let mut qi = 0;
-    let mut positions = Vec::with_capacity(needles.len());
-    let mut score: i32 = 0;
-    let mut prev_matched_at: Option<usize> = None;
-
-    for (ci, (byte, ch)) in haystack.iter().enumerate() {
-        if qi >= needles.len() {
-            break;
-        }
-        let lowered = ch.to_lowercase().next().unwrap_or(*ch);
-        if lowered != needles[qi] {
-            continue;
-        }
-        positions.push(*byte);
-        score += 1;
-        // Adjacent to the previous match — runs of consecutive hits read best.
-        if prev_matched_at == Some(ci.wrapping_sub(1)) {
-            score += 5;
-        }
-        // At a word boundary (string start, after a separator, or a camelCase hump).
-        let at_boundary = ci == 0 || {
-            let prev = haystack[ci - 1].1;
-            !prev.is_alphanumeric() || (prev.is_lowercase() && ch.is_uppercase())
-        };
-        if at_boundary {
-            score += 8;
-        }
-        // Mild bias toward earlier matches.
-        score -= ci as i32 / 4;
-        prev_matched_at = Some(ci);
-        qi += 1;
-    }
-
-    (qi == needles.len()).then_some((score, positions))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::fuzzy_match;
-
-    fn score(query: &str, text: &str) -> Option<i32> {
-        fuzzy_match(query, text).map(|(s, _)| s)
-    }
-
-    #[test]
-    fn empty_query_matches_everything_with_no_marks() {
-        let (score, marks) = fuzzy_match("", "query: run").unwrap();
-        assert_eq!(score, 0);
-        assert!(marks.is_empty());
-    }
-
-    #[test]
-    fn requires_all_chars_in_order() {
-        assert!(fuzzy_match("run", "query: run").is_some());
-        assert!(fuzzy_match("nur", "query: run").is_none()); // out of order
-        assert!(fuzzy_match("runs", "query: run").is_none()); // extra char
-    }
-
-    #[test]
-    fn match_is_case_insensitive() {
-        assert!(fuzzy_match("RUN", "query: run").is_some());
-        assert!(fuzzy_match("QR", "Query: Run").is_some());
-    }
-
-    #[test]
-    fn marks_point_at_matched_bytes() {
-        let (_, marks) = fuzzy_match("qr", "query: run").unwrap();
-        // 'q' at byte 0, the first 'r' at byte 3 ("que[r]y").
-        assert_eq!(marks, vec![0, 3]);
-    }
-
-    #[test]
-    fn whitespace_in_query_is_ignored() {
-        assert_eq!(score("q run", "query: run"), score("qrun", "query: run"));
-    }
-
-    #[test]
-    fn prefix_beats_scattered_match() {
-        // "run" as a word start should outrank the scattered r…u…n in "regular unit".
-        let prefix = score("run", "run query").unwrap();
-        let scattered = score("run", "regular unit number").unwrap();
-        assert!(
-            prefix > scattered,
-            "prefix {prefix} should beat scattered {scattered}"
-        );
-    }
-
-    #[test]
-    fn consecutive_run_beats_scattered_run() {
-        // Same chars, same text length, no word-boundary help on either side:
-        // the consecutive substring should win on the adjacency bonus alone.
-        let consecutive = score("abc", "abcxx").unwrap();
-        let scattered = score("abc", "axbxc").unwrap();
-        assert!(
-            consecutive > scattered,
-            "consecutive {consecutive} should beat scattered {scattered}"
-        );
     }
 }

@@ -107,6 +107,9 @@ struct Gallery {
     prompt_open: bool,
     /// One-line readout of the last command activated / text submitted.
     last_command: Option<SharedString>,
+
+    // --- Switcher demo: Zed-style connection switcher (trigger + popover) ---
+    switcher: Entity<Switcher>,
 }
 
 impl Gallery {
@@ -167,6 +170,56 @@ impl Gallery {
         })
         .detach();
 
+        // The connection switcher: a trigger that opens a sectioned, searchable
+        // popover. Seeded with fake connections so its sections, badges, dots and
+        // checkmark are all visible at rest.
+        let switcher = cx.new(|cx| {
+            let mut s = Switcher::new("demo-switcher", cx);
+            s.set_placeholder("Search connections…", cx);
+            s.set_trigger("Production", Some(cx.theme().green), cx);
+            let theme = cx.theme();
+            let (green, blue, purple, dim) =
+                (theme.green, theme.blue, theme.purple, theme.text_dim);
+            s.set_sections(
+                vec![
+                    SwitcherSection::new(
+                        "This window",
+                        vec![SwitcherItem::new("conn:prod", "Production")
+                            .detail("postgres · prod.db.internal")
+                            .dot(green)
+                            .badge(SwitcherBadge::new("warm", green))
+                            .checked(true)],
+                    ),
+                    SwitcherSection::new(
+                        "Recent",
+                        vec![
+                            SwitcherItem::new("conn:staging", "Staging")
+                                .detail("12m ago")
+                                .dot(blue)
+                                .badge(SwitcherBadge::new("cold", dim)),
+                            SwitcherItem::new("conn:analytics", "Analytics")
+                                .detail("2h ago")
+                                .dot(purple)
+                                .badge(SwitcherBadge::new("cold", dim)),
+                        ],
+                    ),
+                    SwitcherSection::untitled(vec![
+                        SwitcherItem::new("action:new", "New connection…"),
+                        SwitcherItem::new("action:manage", "Manage connections…"),
+                    ]),
+                ],
+                cx,
+            );
+            s
+        });
+        cx.subscribe(&switcher, |this, _, event: &SwitcherEvent, cx| {
+            if let SwitcherEvent::Activate(id) = event {
+                this.last_command = Some(format!("switched to {id:?}").into());
+            }
+            cx.notify();
+        })
+        .detach();
+
         Self {
             name_input: cx.new(|cx| TextInput::new(cx).with_content("Production")),
             host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("sftp.example.com")),
@@ -192,6 +245,7 @@ impl Gallery {
             prompt,
             prompt_open: false,
             last_command: None,
+            switcher,
             row_menu: None,
             drag_items: vec![
                 DragItem {
@@ -1315,6 +1369,11 @@ impl Render for Gallery {
             .child(self.section("Toggle", toggles, cx))
             .child(self.section("Segmented", segmented, cx))
             .child(self.section("Select", select, cx))
+            .child(self.section(
+                "Switcher (trigger + searchable sectioned popover)",
+                self.switcher.clone(),
+                cx,
+            ))
             .child(self.section("Number input", number_input, cx))
             .child(self.section("Context menu", context_menu, cx))
             .child(self.section("Toasts", toasts, cx))
@@ -1531,6 +1590,7 @@ fn main() {
         TextInput::bind_keys(cx);
         CodeEditor::bind_keys(cx);
         Palette::bind_keys(cx);
+        Switcher::bind_keys(cx);
 
         // Kick off generation of the 2M-row SQLite table for spike A so it's
         // ready by the time anyone switches the streaming grid to it.

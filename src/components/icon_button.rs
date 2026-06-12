@@ -3,8 +3,9 @@
 //! `IconButton` - a compact square icon-only button. Takes its glyph as a
 //! generic `impl IntoElement` child (never an icon enum), staying domain-free.
 
-use gpui::{div, prelude::*, AnyElement, App, ClickEvent, ElementId, Window};
+use gpui::{div, prelude::*, AnyElement, App, ClickEvent, ElementId, SharedString, Window};
 
+use crate::components::tooltip::Tooltip;
 use crate::styled_ext::StyledExt;
 use crate::theme::ActiveTheme;
 
@@ -37,6 +38,7 @@ pub struct IconButton {
     active: bool,
     disabled: bool,
     on_click: Option<ClickHandler>,
+    tooltip: Option<SharedString>,
 }
 
 impl IconButton {
@@ -48,7 +50,14 @@ impl IconButton {
             active: false,
             disabled: false,
             on_click: None,
+            tooltip: None,
         }
+    }
+
+    /// A hover tooltip (e.g. the action's name + its keyboard shortcut).
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
+        self
     }
 
     pub fn size(mut self, size: IconButtonSize) -> Self {
@@ -100,7 +109,8 @@ impl RenderOnce for IconButton {
             .rounded(theme.radius_sm)
             .text_color(fg)
             .bg(bg)
-            .child(self.icon);
+            .child(self.icon)
+            .when_some(self.tooltip, |d, text| d.tooltip(Tooltip::text(text)));
 
         let interactive = if self.disabled {
             base.disabled_look()

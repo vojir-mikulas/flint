@@ -69,7 +69,7 @@ impl RenderOnce for Segmented {
                 .h(gpui::px(24.))
                 .px_3()
                 .rounded(theme.radius_sm)
-                .text_sm()
+                .text_size(theme.font_size)
                 .text_color(fg)
                 .bg(bg)
                 .cursor_pointer()

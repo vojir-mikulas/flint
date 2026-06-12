@@ -100,7 +100,7 @@ impl RenderOnce for Tabs {
                 .h(gpui::px(24.))
                 .px_2p5()
                 .rounded(theme.radius_sm)
-                .text_sm()
+                .text_size(theme.font_size)
                 .text_color(fg)
                 .bg(bg)
                 .cursor_pointer()

@@ -111,9 +111,14 @@ impl RenderOnce for ContextMenu {
                     .py_1p5()
                     .rounded(gpui::px(4.))
                     .text_color(base_color)
-                    .child(div().flex_1().text_sm().child(item.label))
+                    .child(div().flex_1().text_size(theme.font_size).child(item.label))
                     .when_some(item.shortcut, |this, sc| {
-                        this.child(div().text_xs().text_color(theme.text_faint).child(sc))
+                        this.child(
+                            div()
+                                .text_size(theme.font_size_xs())
+                                .text_color(theme.text_faint)
+                                .child(sc),
+                        )
                     });
 
                 if item.disabled {
@@ -135,6 +140,8 @@ impl RenderOnce for ContextMenu {
             .flex_col()
             .min_w(gpui::px(180.))
             .p_1()
+            .font_family(theme.font_family.clone())
+            .text_size(theme.font_size)
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_strong)

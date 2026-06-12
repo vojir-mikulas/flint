@@ -4,11 +4,21 @@
 //! arbitrary `impl IntoElement`. Place it last in a positioned container (or
 //! behind a [`gpui::deferred`] layer) so it paints above the rest of the UI.
 
-use gpui::{div, prelude::*, AnyElement, App, ElementId, MouseButton, SharedString, Window};
+use gpui::{
+    actions, div, prelude::*, AnyElement, App, ElementId, FocusHandle, KeyBinding, MouseButton,
+    SharedString, Window,
+};
 
 use crate::theme::ActiveTheme;
 
+// Tab navigation within a focused modal. Scoped to the `Modal` key context (set
+// on the scrim when the modal is given a focus handle), so it cycles a modal's
+// own controls without touching tab behaviour elsewhere. A deeper context — a
+// focused `TextInput` — keeps its own Tab handling and wins.
+actions!(modal, [FocusNext, FocusPrev]);
+
 type CloseHandler = Box<dyn Fn(&mut Window, &mut App) + 'static>;
+type ConfirmHandler = Box<dyn Fn(&mut Window, &mut App) + 'static>;
 
 #[derive(IntoElement)]
 pub struct Modal {
@@ -18,6 +28,8 @@ pub struct Modal {
     body: Vec<AnyElement>,
     footer: Option<AnyElement>,
     on_close: Option<CloseHandler>,
+    on_confirm: Option<ConfirmHandler>,
+    focus_handle: Option<FocusHandle>,
 }
 
 impl Modal {
@@ -29,7 +41,18 @@ impl Modal {
             body: Vec::new(),
             footer: None,
             on_close: None,
+            on_confirm: None,
+            focus_handle: None,
         }
+    }
+
+    /// Install the modal's `Tab`/`Shift-Tab` focus-cycling bindings (scoped to the
+    /// `Modal` context). Call once at startup, like the other component keymaps.
+    pub fn bind_keys(cx: &mut App) {
+        cx.bind_keys([
+            KeyBinding::new("tab", FocusNext, Some("Modal")),
+            KeyBinding::new("shift-tab", FocusPrev, Some("Modal")),
+        ]);
     }
 
     /// Without a title the header is omitted.
@@ -48,9 +71,31 @@ impl Modal {
         self
     }
 
-    /// Invoked by the × button and a scrim click.
+    /// Invoked by the × button, a scrim click, and (with a [`focus_handle`]) the
+    /// `Esc` key.
+    ///
+    /// [`focus_handle`]: Self::focus_handle
     pub fn on_close(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
         self.on_close = Some(Box::new(handler));
+        self
+    }
+
+    /// The primary action, invoked by `Enter` when the modal holds keyboard focus
+    /// (requires a [`focus_handle`]). Pair it with a focused primary button.
+    ///
+    /// [`focus_handle`]: Self::focus_handle
+    pub fn on_confirm(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_confirm = Some(Box::new(handler));
+        self
+    }
+
+    /// Give the modal keyboard focus via a caller-owned handle, so `Esc` closes
+    /// and `Enter` confirms. The caller focuses the handle when it opens the modal
+    /// (the element is stateless, so it can't grab focus itself). Modals whose
+    /// body owns the focus (a form field) should leave this unset and focus that
+    /// field instead.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
         self
     }
 }
@@ -65,6 +110,8 @@ impl RenderOnce for Modal {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let on_close = self.on_close.map(std::rc::Rc::new);
+        let on_confirm = self.on_confirm.map(std::rc::Rc::new);
+        let focus_handle = self.focus_handle;
 
         let header = self.title.map(|title| {
             let close = on_close.clone();
@@ -79,7 +126,7 @@ impl RenderOnce for Modal {
                 .child(
                     div()
                         .flex_1()
-                        .text_sm()
+                        .text_size(theme.font_size)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(theme.text)
                         .child(title),
@@ -128,6 +175,8 @@ impl RenderOnce for Modal {
             .flex_col()
             .w(self.width)
             .max_h(gpui::relative(0.88))
+            .font_family(theme.font_family.clone())
+            .text_size(theme.font_size)
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border_strong)
@@ -145,6 +194,12 @@ impl RenderOnce for Modal {
             )
             .when_some(footer, |this, footer| this.child(footer));
 
+        // Key handling rides on the scrim (an ancestor of every focusable child),
+        // so it fires whether the modal root or a child button holds focus. `Esc`
+        // closes, `Enter` confirms — both no-op without their handler.
+        let key_close = on_close.clone();
+        let key_confirm = on_confirm.clone();
+
         div()
             .id(self.id)
             .absolute()
@@ -156,6 +211,27 @@ impl RenderOnce for Modal {
             // Block all mouse interaction with the UI behind the scrim, so a
             // click that dismisses the modal can't also fire an element under it.
             .occlude()
+            .when_some(focus_handle, |this, handle| {
+                this.track_focus(&handle)
+                    .key_context("Modal")
+                    // Tab cycles the modal's own controls (the focus trap keeps it
+                    // from escaping to the backdrop is the caller's to install).
+                    .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
+                    .on_action(|_: &FocusPrev, window, cx| window.focus_prev(cx))
+                    .on_key_down(move |event, window, cx| match event.keystroke.key.as_str() {
+                        "escape" => {
+                            if let Some(close) = key_close.as_ref() {
+                                close(window, cx);
+                            }
+                        }
+                        "enter" => {
+                            if let Some(confirm) = key_confirm.as_ref() {
+                                confirm(window, cx);
+                            }
+                        }
+                        _ => {}
+                    })
+            })
             .when_some(on_close, |this, close| {
                 this.on_mouse_down(MouseButton::Left, move |_, window, cx| close(window, cx))
             })

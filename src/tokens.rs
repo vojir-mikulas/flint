@@ -53,6 +53,10 @@ impl Theme {
             row_height: px(26.0),
             radius: px(5.0),
             radius_sm: px(3.0),
+
+            font_family: "IBM Plex Sans".into(),
+            mono_family: "IBM Plex Mono".into(),
+            font_size: px(13.0),
         }
     }
 
@@ -96,6 +100,10 @@ impl Theme {
             row_height: px(26.0),
             radius: px(5.0),
             radius_sm: px(3.0),
+
+            font_family: "IBM Plex Sans".into(),
+            mono_family: "IBM Plex Mono".into(),
+            font_size: px(13.0),
         }
     }
 
@@ -139,6 +147,10 @@ impl Theme {
             row_height: px(26.0),
             radius: px(5.0),
             radius_sm: px(3.0),
+
+            font_family: "IBM Plex Sans".into(),
+            mono_family: "IBM Plex Mono".into(),
+            font_size: px(13.0),
         }
     }
 
@@ -182,6 +194,10 @@ impl Theme {
             row_height: px(26.0),
             radius: px(5.0),
             radius_sm: px(3.0),
+
+            font_family: "IBM Plex Sans".into(),
+            mono_family: "IBM Plex Mono".into(),
+            font_size: px(13.0),
         }
     }
 }

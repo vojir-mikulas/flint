@@ -57,14 +57,15 @@ impl NumberInput {
         // user mid-number (typing "14" snaps "1" up to the minimum). Instead we
         // only translate the text into a clamped value on Enter — and on blur,
         // wired up in `render` once a `Window` is available. Esc discards the edit.
-        let subscription = cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
-            TextInputEvent::Submit => this.commit(cx),
-            TextInputEvent::Cancel => {
-                let value = this.value;
-                this.set_value(value, cx);
-            }
-            TextInputEvent::Change => {}
-        });
+        let subscription =
+            cx.subscribe(&input, |this, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Submit => this.commit(cx),
+                TextInputEvent::Cancel => {
+                    let value = this.value;
+                    this.set_value(value, cx);
+                }
+                TextInputEvent::Change => {}
+            });
 
         Self {
             id: id.into(),
@@ -177,7 +178,8 @@ impl Render for NumberInput {
         // it lives as long as the component.
         if self.blur_subscription.is_none() {
             let handle = self.focus_handle(cx);
-            self.blur_subscription = Some(cx.on_blur(&handle, window, |this, _, cx| this.commit(cx)));
+            self.blur_subscription =
+                Some(cx.on_blur(&handle, window, |this, _, cx| this.commit(cx)));
         }
 
         // One stepper button: a square, full-height tap target that brightens on
@@ -211,7 +213,7 @@ impl Render for NumberInput {
                 theme.border
             })
             .overflow_hidden()
-            .text_sm()
+            .text_size(theme.font_size)
             .child(button("num-dec", "−", -step))
             .child(div().w(px(1.)).h_full().bg(theme.border))
             .child(

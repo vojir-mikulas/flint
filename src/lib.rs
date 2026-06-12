@@ -34,13 +34,14 @@ pub use components::scrollbar::{Scrollbar, ScrollbarState};
 pub use components::segmented::Segmented;
 pub use components::select::Select;
 pub use components::split_pane::{DragAnchor, SplitPane};
-pub use components::table::{CellRange, Column, ColumnAlign, ColumnWidth, Table};
+pub use components::switcher::{Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection};
+pub use components::table::{CellRange, Column, ColumnAlign, ColumnWidth, Table, TableNav};
 pub use components::tabs::Tabs;
 pub use components::text_input::{TextInput, TextInputEvent};
 pub use components::toast::{Toast, ToastVariant};
 pub use components::toggle::Toggle;
 pub use components::tooltip::Tooltip;
-pub use components::tree::{Tree, TreeItem};
+pub use components::tree::{Tree, TreeItem, TreeNav};
 pub use styled_ext::StyledExt;
 pub use theme::{ActiveTheme, Theme};
 
@@ -62,13 +63,18 @@ pub mod prelude {
     pub use crate::components::segmented::Segmented;
     pub use crate::components::select::Select;
     pub use crate::components::split_pane::{DragAnchor, SplitPane};
-    pub use crate::components::table::{CellRange, Column, ColumnAlign, ColumnWidth, Table};
+    pub use crate::components::switcher::{
+        Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection,
+    };
+    pub use crate::components::table::{
+        CellRange, Column, ColumnAlign, ColumnWidth, Table, TableNav,
+    };
     pub use crate::components::tabs::Tabs;
     pub use crate::components::text_input::{TextInput, TextInputEvent};
     pub use crate::components::toast::{Toast, ToastVariant};
     pub use crate::components::toggle::Toggle;
     pub use crate::components::tooltip::Tooltip;
-    pub use crate::components::tree::{Tree, TreeItem};
+    pub use crate::components::tree::{Tree, TreeItem, TreeNav};
     pub use crate::styled_ext::StyledExt;
     pub use crate::theme::{ActiveTheme, Theme};
 }

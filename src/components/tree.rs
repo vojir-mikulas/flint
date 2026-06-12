@@ -11,11 +11,27 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, App, ClickEvent, Pixels, SharedString,
+    div, prelude::*, px, uniform_list, App, ClickEvent, FocusHandle, Pixels, SharedString,
     UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
+
+/// A keyboard navigation step over a [`Tree`] — the move-selection *intent* the
+/// tree emits via [`Tree::on_nav`]. The tree owns no selection or expansion
+/// state; the caller moves its selection, toggles expansion, or activates a row
+/// in response.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TreeNav {
+    Up,
+    Down,
+    /// Left — collapse an expanded node, else move to the parent.
+    Collapse,
+    /// Right — expand a collapsed node, else descend to the first child.
+    Expand,
+    /// Enter — activate the selected row.
+    Activate,
+}
 
 /// One visible row's structural facts - everything the chrome needs to draw it.
 /// The caller builds these by flattening its model in display order; the row's
@@ -48,6 +64,8 @@ impl TreeItem {
 type RowRenderer = Rc<dyn Fn(usize, &mut Window, &mut App) -> gpui::AnyElement + 'static>;
 type SelectHandler = Rc<dyn Fn(usize, &ClickEvent, &mut Window, &mut App) + 'static>;
 type IndexHandler = Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>;
+/// Keyboard navigation handler — receives a [`TreeNav`] intent.
+type NavHandler = Rc<dyn Fn(TreeNav, &mut Window, &mut App) + 'static>;
 /// Draws the disclosure indicator for a parent row, given its expanded state.
 type DisclosureRenderer = Rc<dyn Fn(bool, &mut Window, &mut App) -> gpui::AnyElement + 'static>;
 
@@ -64,6 +82,8 @@ pub struct Tree {
     on_activate: Option<IndexHandler>,
     disclosure: Option<DisclosureRenderer>,
     scroll_handle: Option<UniformListScrollHandle>,
+    focus_handle: Option<FocusHandle>,
+    on_nav: Option<NavHandler>,
 }
 
 impl Tree {
@@ -80,6 +100,8 @@ impl Tree {
             on_activate: None,
             disclosure: None,
             scroll_handle: None,
+            focus_handle: None,
+            on_nav: None,
         }
     }
 
@@ -154,6 +176,21 @@ impl Tree {
         self.on_activate = Some(Rc::new(handler));
         self
     }
+
+    /// Make the tree keyboard-focusable via a caller-owned handle, so its
+    /// selection can be driven by the keyboard. Pair with [`on_nav`](Self::on_nav).
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Keyboard navigation handler — ↑/↓ move, ←/→ collapse/expand, Enter
+    /// activates, each emitted as a [`TreeNav`] intent. Requires a
+    /// [`focus_handle`](Self::focus_handle).
+    pub fn on_nav(mut self, handler: impl Fn(TreeNav, &mut Window, &mut App) + 'static) -> Self {
+        self.on_nav = Some(Rc::new(handler));
+        self
+    }
 }
 
 impl RenderOnce for Tree {
@@ -178,6 +215,7 @@ impl RenderOnce for Tree {
         let chevron_color = theme.text_faint;
         let text = theme.text;
         let radius = theme.radius_sm;
+        let glyph_size = theme.font_size_micro();
 
         let list = uniform_list("tree-rows", row_count, move |range, window, cx| {
             let mut out = Vec::with_capacity(range.len());
@@ -208,7 +246,7 @@ impl RenderOnce for Tree {
                     .text_color(chevron_color)
                     .when_some(custom_disclosure, |d, el| d.child(el))
                     .when(glyph_disclosure, |d| {
-                        d.text_size(px(9.))
+                        d.text_size(glyph_size)
                             .child(if item.expanded { "▼" } else { "▶" })
                     });
 
@@ -272,6 +310,30 @@ impl RenderOnce for Tree {
             None => list,
         };
 
-        div().id(self.id).flex().flex_col().size_full().child(list)
+        let on_nav = self.on_nav.clone();
+        div()
+            .id(self.id)
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(list)
+            .when_some(self.focus_handle, |d, handle| {
+                let d = d.track_focus(&handle).key_context("Tree");
+                match on_nav {
+                    Some(on_nav) => d.on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                        let nav = match event.keystroke.key.as_str() {
+                            "up" => TreeNav::Up,
+                            "down" => TreeNav::Down,
+                            "left" => TreeNav::Collapse,
+                            "right" => TreeNav::Expand,
+                            "enter" => TreeNav::Activate,
+                            _ => return,
+                        };
+                        cx.stop_propagation();
+                        on_nav(nav, window, cx);
+                    }),
+                    None => d,
+                }
+            })
     }
 }

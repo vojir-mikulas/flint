@@ -4,7 +4,7 @@
 //! the [`ActiveTheme`] accessor. Tokens are semantic and generic (`bg_panel`,
 //! `accent`) - never app-specific. Concrete values live in `tokens.rs`.
 
-use gpui::{App, Global, Hsla, Pixels};
+use gpui::{px, App, Global, Hsla, Pixels, SharedString};
 
 /// A complete set of design tokens for one theme. Read in `render` via
 /// `cx.theme()`. Ported from `design/styles.css`.
@@ -66,6 +66,51 @@ pub struct Theme {
     pub radius: Pixels,
     /// Small corner radius (chips, icon buttons, menu items).
     pub radius_sm: Pixels,
+
+    /// The UI (sans) font family — chrome: toolbars, tabs, sidebars, menus,
+    /// status bar. Components set this on floating surfaces (palettes, menus,
+    /// tooltips) that render outside the root's inheritance tree; inline elements
+    /// inherit it from the window root.
+    pub font_family: SharedString,
+    /// The monospace font family — code + tabular data: the editor, the result
+    /// grid cells, schema identifiers. The host app drives both families; setting
+    /// them to the same value makes the whole UI render in one font.
+    pub mono_family: SharedString,
+    /// Base ("md") UI text size. The whole type ramp ([`Theme::font_size_xs`]
+    /// … [`Theme::font_size_lg`]) scales proportionally from this one value, so
+    /// the host app drives the entire UI by setting just `font_size`.
+    pub font_size: Pixels,
+}
+
+impl Theme {
+    /// The base UI text size the built-in themes ship with. Host apps tune their
+    /// hand-placed pixel sizes against this and pass them through [`Theme::scale`]
+    /// so the whole UI tracks the active `font_size`.
+    pub const DEFAULT_FONT_SIZE: f32 = 13.0;
+
+    /// Scale a design-time pixel size (tuned against [`DEFAULT_FONT_SIZE`](Self::DEFAULT_FONT_SIZE))
+    /// by the active base `font_size`. At the default size this is the identity,
+    /// so existing layouts are pixel-stable while still tracking the user's scale.
+    pub fn scale(&self, design_px: f32) -> Pixels {
+        px(design_px * f32::from(self.font_size) / Self::DEFAULT_FONT_SIZE)
+    }
+
+    /// Tiny labels (deep tree rows, select-item secondary text). 9px at default.
+    pub fn font_size_micro(&self) -> Pixels {
+        self.scale(9.0)
+    }
+    /// Extra-small text (chips, shortcut hints). 11px at default.
+    pub fn font_size_xs(&self) -> Pixels {
+        self.scale(11.0)
+    }
+    /// Small / secondary text. 12px at default.
+    pub fn font_size_sm(&self) -> Pixels {
+        self.scale(12.0)
+    }
+    /// Large text (palette input, headings). 15px at default.
+    pub fn font_size_lg(&self) -> Pixels {
+        self.scale(15.0)
+    }
 }
 
 impl Global for Theme {}

@@ -8,6 +8,7 @@ use gpui::{
     Hsla, SharedString, Window,
 };
 
+use crate::components::tooltip::Tooltip;
 use crate::styled_ext::StyledExt;
 use crate::theme::ActiveTheme;
 
@@ -40,6 +41,7 @@ pub struct Button {
     focusable: bool,
     focus_handle: Option<FocusHandle>,
     on_click: Option<ClickHandler>,
+    tooltip: Option<SharedString>,
 }
 
 impl Button {
@@ -57,7 +59,14 @@ impl Button {
             focusable: true,
             focus_handle: None,
             on_click: None,
+            tooltip: None,
         }
+    }
+
+    /// A hover tooltip (e.g. the action's name + its keyboard shortcut).
+    pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
+        self.tooltip = Some(text.into());
+        self
     }
 
     /// Whether the button participates in keyboard focus / tab order.
@@ -133,6 +142,10 @@ impl RenderOnce for Button {
             ButtonSize::Sm => 24.0,
             ButtonSize::Md => 32.0,
         };
+        let text_size = match self.size {
+            ButtonSize::Sm => theme.font_size_xs(),
+            ButtonSize::Md => theme.font_size,
+        };
 
         // Sm scales text and horizontal padding down too — not just height — so a
         // small button reads as small next to compact chrome (e.g. a toolbar's
@@ -145,16 +158,18 @@ impl RenderOnce for Button {
             .gap_2()
             .h(gpui::px(height))
             .map(|this| match self.size {
-                ButtonSize::Sm => this.px_2().text_xs(),
-                ButtonSize::Md => this.px_3().text_sm(),
+                ButtonSize::Sm => this.px_2(),
+                ButtonSize::Md => this.px_3(),
             })
+            .text_size(text_size)
             .rounded_md()
             .bg(bg)
             .text_color(fg)
             .border_1()
             .border_color(border)
             .when_some(self.icon, |this, icon| this.child(icon))
-            .child(self.label);
+            .child(self.label)
+            .when_some(self.tooltip, |this, text| this.tooltip(Tooltip::text(text)));
 
         let ring = theme.accent;
         let glow = theme.accent_ghost;

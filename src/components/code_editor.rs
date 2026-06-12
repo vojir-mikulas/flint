@@ -93,10 +93,15 @@ pub type Highlighter = Rc<dyn Fn(&str) -> Vec<(Range<usize>, TokenStyle)>>;
 /// keyword candidates; the editor never knows what a "table" is.
 pub type CompletionProvider = Rc<dyn Fn(&str, usize) -> Vec<SharedString>>;
 
-/// Emitted so the owner reacts to ⌘↵ without the editor knowing what "run" means.
+/// Emitted so the owner reacts to editor-level keys without the editor knowing
+/// what they mean.
 #[derive(Clone, Copy, Debug)]
 pub enum CodeEditorEvent {
+    /// ⌘↵ — the owner runs the buffer / selection.
     Run,
+    /// Esc with no completion popup open — the owner can move focus elsewhere
+    /// (the completion-dismiss case is handled internally and emits nothing).
+    Escape,
 }
 
 /// An open completion popup: the word being completed starts at `start` (replaced
@@ -527,8 +532,12 @@ impl CodeEditor {
         cx.emit(CodeEditorEvent::Run);
     }
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
+        // Esc first dismisses an open completion popup; with none open it's the
+        // owner's to act on (e.g. move focus out of the editor).
         if self.completion.take().is_some() {
             cx.notify();
+        } else {
+            cx.emit(CodeEditorEvent::Escape);
         }
     }
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {

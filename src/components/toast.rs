@@ -116,7 +116,8 @@ impl RenderOnce for Toast {
             .border_color(theme.border_strong)
             .rounded(gpui::px(7.))
             .shadow_lg()
-            .text_sm()
+            .font_family(theme.font_family.clone())
+            .text_size(theme.font_size)
             .text_color(theme.text)
             .child(row)
             .when_some(self.progress, |card, fraction| {

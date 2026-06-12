@@ -10,11 +10,34 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, point, prelude::*, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
-    ElementId, ExternalPaths, IsZero, MouseButton, Pixels, Point, ScrollHandle, ScrollWheelEvent,
-    SharedString, Styled, UniformListScrollHandle, Window,
+    ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, Pixels, Point, ScrollHandle,
+    ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
+
+/// A keyboard cell-cursor move over a [`Table`] — the move-selection *intent* the
+/// table emits via [`Table::on_nav`]. The table is generic and windowed, so it
+/// reports the intent (and whether Shift extends the selection); the caller owns
+/// the cursor, decides what each move means against its data, and computes things
+/// the table can't know (e.g. how many rows a page is).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TableNav {
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Home / ⌘← — row start.
+    RowStart,
+    /// End / ⌘→ — row end.
+    RowEnd,
+    PageUp,
+    PageDown,
+    /// ⌘↑ — first row.
+    First,
+    /// ⌘↓ — last row.
+    Last,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum ColumnWidth {
@@ -158,6 +181,9 @@ type RowDropItemHandler<D> = Rc<dyn Fn(usize, &D, &mut Window, &mut App) + 'stat
 /// drag-out returning inside the window).
 type RowBoundsHandler = Rc<dyn Fn(usize, Bounds<Pixels>, &mut Window, &mut App) + 'static>;
 
+/// Keyboard cell-cursor handler `(nav, extend)`; `extend` is Shift-held.
+type NavHandler = Rc<dyn Fn(TableNav, bool, &mut Window, &mut App) + 'static>;
+
 type PreviewFn = Box<dyn Fn(&mut Window, &mut App) -> gpui::AnyElement + 'static>;
 /// Per-row boolean predicate (selected / draggable / droppable / highlighted).
 /// Queried only for visible rows, so it stays O(1) even for huge listings - the
@@ -207,10 +233,17 @@ pub struct Table<D: 'static = ()> {
     on_visible_range: Option<VisibleRangeHandler>,
     selected_cells: Option<CellRange>,
     on_cell_click: Option<CellClickHandler>,
+    focus_handle: Option<FocusHandle>,
+    on_nav: Option<NavHandler>,
     horizontal: bool,
     /// Font family for the header + cells (e.g. a monospace data grid). `None`
     /// inherits the ambient family.
     font_family: Option<SharedString>,
+    /// Text size for the header + cells. `None` inherits the ambient size — but
+    /// because `uniform_list` rows are laid out as independent layout roots, an
+    /// inherited size does not reach them, so a caller that wants the data to
+    /// track a configurable UI size must set this explicitly.
+    text_size: Option<Pixels>,
     /// Draw 1px separators between cells and rows (a spreadsheet look).
     grid_lines: bool,
 }
@@ -245,8 +278,11 @@ impl<D: 'static> Table<D> {
             on_visible_range: None,
             selected_cells: None,
             on_cell_click: None,
+            focus_handle: None,
+            on_nav: None,
             horizontal: false,
             font_family: None,
+            text_size: None,
             grid_lines: false,
         }
     }
@@ -254,6 +290,13 @@ impl<D: 'static> Table<D> {
     /// Render the header + cells in `family` (e.g. a monospace data grid).
     pub fn font_family(mut self, family: impl Into<SharedString>) -> Self {
         self.font_family = Some(family.into());
+        self
+    }
+
+    /// Render the header + cells at `size`. Required for the data to track a
+    /// configurable UI size, since the virtualized rows don't inherit it.
+    pub fn text_size(mut self, size: Pixels) -> Self {
+        self.text_size = Some(size);
         self
     }
 
@@ -276,6 +319,27 @@ impl<D: 'static> Table<D> {
         handler: impl Fn(usize, usize, &ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_cell_click = Some(Rc::new(handler));
+        self
+    }
+
+    /// Make the table keyboard-focusable via a caller-owned handle, so its cell
+    /// cursor can be driven by the keyboard. Pair with [`on_nav`](Self::on_nav);
+    /// the caller focuses the handle (e.g. on click or a focus shortcut). Without
+    /// it the table stays mouse-only.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Cell-cursor keyboard handler — arrows/Home/End/PageUp-Down/⌘arrows emit a
+    /// [`TableNav`] intent (with `extend` for Shift). Requires a
+    /// [`focus_handle`](Self::focus_handle). The table owns no selection state; the
+    /// caller moves its own cursor in response.
+    pub fn on_nav(
+        mut self,
+        handler: impl Fn(TableNav, bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_nav = Some(Rc::new(handler));
         self
     }
 
@@ -465,6 +529,34 @@ impl<D: 'static> Table<D> {
     }
 }
 
+/// The cell-cursor key handler installed when a table is focusable: arrows,
+/// Home/End, PageUp/Down, and ⌘-arrows map to a [`TableNav`] (Shift extends).
+fn table_key_nav(
+    on_nav: NavHandler,
+) -> impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static {
+    move |event, window, cx| {
+        let ks = &event.keystroke;
+        let cmd = ks.modifiers.secondary();
+        let nav = match ks.key.as_str() {
+            "up" if cmd => TableNav::First,
+            "down" if cmd => TableNav::Last,
+            "left" if cmd => TableNav::RowStart,
+            "right" if cmd => TableNav::RowEnd,
+            "up" => TableNav::Up,
+            "down" => TableNav::Down,
+            "left" => TableNav::Left,
+            "right" => TableNav::Right,
+            "home" => TableNav::RowStart,
+            "end" => TableNav::RowEnd,
+            "pageup" => TableNav::PageUp,
+            "pagedown" => TableNav::PageDown,
+            _ => return,
+        };
+        cx.stop_propagation();
+        on_nav(nav, ks.modifiers.shift, window, cx);
+    }
+}
+
 impl<D: 'static> RenderOnce for Table<D> {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
@@ -475,6 +567,7 @@ impl<D: 'static> RenderOnce for Table<D> {
         let grid_lines = self.grid_lines;
         let line = theme.border_soft;
         let font_family = self.font_family.clone();
+        let text_size = self.text_size;
 
         let on_sort = self.on_sort.clone();
         let caret_asc = self.sort_caret_asc.clone();
@@ -541,6 +634,7 @@ impl<D: 'static> RenderOnce for Table<D> {
             .border_color(theme.border_soft)
             .text_xs()
             .when_some(font_family.clone(), |d, f| d.font_family(f))
+            .when_some(text_size, |d, s| d.text_size(s))
             .children(header_cells);
 
         let columns_for_rows = columns.clone();
@@ -570,6 +664,8 @@ impl<D: 'static> RenderOnce for Table<D> {
 
         let selected_cells = self.selected_cells;
         let on_cell_click = self.on_cell_click.clone();
+        let focus_handle = self.focus_handle.clone();
+        let on_nav = self.on_nav.clone();
 
         let list = uniform_list("table-rows", row_count, move |range, window, cx| {
             // Report the about-to-render window so a windowed source can fill the
@@ -658,6 +754,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                         .text_color(text)
                         .when(grid_lines, |this| this.border_b_1().border_color(line))
                         .when_some(font_family.clone(), |this, f| this.font_family(f))
+                        .when_some(text_size, |this, s| this.text_size(s))
                         .when(is_selected, |this| this.bg(bg_selected))
                         .when(!is_selected, |this| this.hover(move |s| s.bg(bg_hover)))
                         // A forced drop-target highlight (e.g. a platform drag GPUI
@@ -851,7 +948,14 @@ impl<D: 'static> RenderOnce for Table<D> {
                 );
             }
 
-            root.child(hscroll)
+            let root = root.child(hscroll);
+            root.when_some(focus_handle.clone(), |d, handle| {
+                let d = d.track_focus(&handle).key_context("Table");
+                match on_nav.clone() {
+                    Some(on_nav) => d.on_key_down(table_key_nav(on_nav)),
+                    None => d,
+                }
+            })
         } else {
             div()
                 .id(self.id)
@@ -860,6 +964,13 @@ impl<D: 'static> RenderOnce for Table<D> {
                 .size_full()
                 .child(header)
                 .child(list)
+                .when_some(focus_handle.clone(), |d, handle| {
+                    let d = d.track_focus(&handle).key_context("Table");
+                    match on_nav.clone() {
+                        Some(on_nav) => d.on_key_down(table_key_nav(on_nav)),
+                        None => d,
+                    }
+                })
         }
     }
 }

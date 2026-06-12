@@ -865,13 +865,15 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + align_offset
+                            bounds.left()
+                                + align_offset
                                 + line.x_for_index(map_offset(selected_range.start))
                                 - scroll_offset,
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + align_offset
+                            bounds.left()
+                                + align_offset
                                 + line.x_for_index(map_offset(selected_range.end))
                                 - scroll_offset,
                             bounds.bottom(),
@@ -967,7 +969,7 @@ impl Render for TextInput {
                 .border_1()
                 .border_color(cx.theme().border)
                 .rounded(cx.theme().radius)
-                .text_sm()
+                .text_size(cx.theme().font_size)
                 .text_color(cx.theme().text)
         };
         let mut field = field
