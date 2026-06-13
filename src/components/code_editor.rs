@@ -122,6 +122,9 @@ pub struct CodeEditor {
     read_only: bool,
     /// Preserved column for vertical navigation, in bytes within a line.
     desired_col: Option<usize>,
+    /// Corner radius of the editor frame; `None` uses `theme.radius`. `Some(px(0.))`
+    /// gives square corners (see [`Self::corner_radius`]).
+    corner_radius: Option<Pixels>,
     highlighter: Option<Highlighter>,
     completion_provider: Option<CompletionProvider>,
     completion: Option<Completion>,
@@ -142,6 +145,7 @@ impl CodeEditor {
             is_selecting: false,
             read_only: false,
             desired_col: None,
+            corner_radius: None,
             highlighter: None,
             completion_provider: None,
             completion: None,
@@ -154,6 +158,13 @@ impl CodeEditor {
     pub fn with_content(mut self, content: impl Into<String>) -> Self {
         self.content = content.into();
         self.selected_range = 0..0;
+        self
+    }
+
+    /// Override the editor frame's corner radius (default: `theme.radius`). Pass
+    /// `px(0.)` for square corners — e.g. an editor that fills a pane flush.
+    pub fn corner_radius(mut self, radius: Pixels) -> Self {
+        self.corner_radius = Some(radius);
         self
     }
 
@@ -1068,7 +1079,7 @@ impl Render for CodeEditor {
             .bg(theme.bg_app)
             .border_1()
             .border_color(if focused { theme.accent } else { theme.border })
-            .rounded(theme.radius)
+            .rounded(self.corner_radius.unwrap_or(theme.radius))
             .overflow_hidden()
             .key_context("CodeEditor")
             .track_focus(&self.focus_handle(cx))

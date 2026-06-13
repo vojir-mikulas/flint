@@ -56,6 +56,10 @@ pub struct SplitPane {
     size: Pixels,
     min_first: Pixels,
     max_first: Option<Pixels>,
+    /// Width of the draggable gutter the 1px separator line sits in. The default
+    /// (`px(7.)`) gives a calm line floating in a comfortable grab strip; set it to
+    /// `px(1.)` for a flush, border-only divider with no surrounding padding.
+    gutter: Pixels,
     drag: Option<DragAnchor>,
     first: Option<AnyElement>,
     second: Option<AnyElement>,
@@ -73,6 +77,7 @@ impl SplitPane {
             size: px(280.),
             min_first: px(80.),
             max_first: None,
+            gutter: px(7.),
             drag: None,
             first: None,
             second: None,
@@ -101,6 +106,13 @@ impl SplitPane {
 
     pub fn max_first(mut self, max: Pixels) -> Self {
         self.max_first = Some(max);
+        self
+    }
+
+    /// Width of the draggable divider gutter. Default `px(7.)`; pass `px(1.)` for a
+    /// flush border-only divider (the separator line with no surrounding padding).
+    pub fn gutter(mut self, width: Pixels) -> Self {
+        self.gutter = width;
         self
     }
 
@@ -157,9 +169,11 @@ impl RenderOnce for SplitPane {
         let horizontal = axis == Axis::Horizontal;
         let trailing = self.side == SplitSide::Trailing;
         let size = self.clamp(self.size);
-        // A calm 1px separator centered in a wider grab gutter; the line picks up
-        // the accent while the gutter is hovered (so the whole strip is grabbable
-        // but the chrome stays a thin line, not a thick bar).
+        // A calm 1px separator centered in a grab gutter (`gutter`-wide); the line
+        // picks up the accent while the gutter is hovered (so the whole strip is
+        // grabbable but the chrome stays a thin line, not a thick bar). A `gutter`
+        // of 1px collapses the padding to a flush, border-only divider.
+        let gutter = self.gutter;
         let line_color = theme.border;
         let line_hover = theme.accent;
 
@@ -203,8 +217,8 @@ impl RenderOnce for SplitPane {
             .flex()
             .items_center()
             .justify_center()
-            .when(horizontal, |s| s.w(px(7.)).h_full().cursor_ew_resize())
-            .when(!horizontal, |s| s.h(px(7.)).w_full().cursor_ns_resize())
+            .when(horizontal, |s| s.w(gutter).h_full().cursor_ew_resize())
+            .when(!horizontal, |s| s.h(gutter).w_full().cursor_ns_resize())
             .child(line)
             .when_some(on_drag_start, |this, handler| {
                 this.on_mouse_down(MouseButton::Left, move |event, window, cx| {
