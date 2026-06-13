@@ -37,7 +37,7 @@ pub use components::segmented::Segmented;
 pub use components::select::Select;
 pub use components::split_pane::{DragAnchor, SplitPane, SplitSide};
 pub use components::switcher::{
-    Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection,
+    Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,
 };
 pub use components::table::{CellRange, Column, ColumnAlign, ColumnWidth, Table, TableNav};
 pub use components::tabs::Tabs;
@@ -48,7 +48,7 @@ pub use components::tooltip::Tooltip;
 pub use components::tree::{Tree, TreeItem, TreeNav};
 pub use scrim::ScrimDismiss;
 pub use styled_ext::StyledExt;
-pub use theme::{ActiveTheme, Theme};
+pub use theme::{ActiveTheme, MotionPreference, ReduceMotion, Theme};
 
 /// Everything you need with a single `use flint::prelude::*;`.
 pub mod prelude {
@@ -70,7 +70,7 @@ pub mod prelude {
     pub use crate::components::select::Select;
     pub use crate::components::split_pane::{DragAnchor, SplitPane, SplitSide};
     pub use crate::components::switcher::{
-        Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection,
+        Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,
     };
     pub use crate::components::table::{
         CellRange, Column, ColumnAlign, ColumnWidth, Table, TableNav,
@@ -83,5 +83,5 @@ pub mod prelude {
     pub use crate::components::tree::{Tree, TreeItem, TreeNav};
     pub use crate::scrim::ScrimDismiss;
     pub use crate::styled_ext::StyledExt;
-    pub use crate::theme::{ActiveTheme, Theme};
+    pub use crate::theme::{ActiveTheme, MotionPreference, ReduceMotion, Theme};
 }

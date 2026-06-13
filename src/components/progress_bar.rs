@@ -6,10 +6,11 @@
 use std::time::Duration;
 
 use gpui::{
-    div, ease_in_out, prelude::*, px, relative, Animation, AnimationExt, App, ElementId, Window,
+    div, ease_in_out, prelude::*, px, relative, Animation, AnimationExt, App, ElementId, Role,
+    Window,
 };
 
-use crate::theme::ActiveTheme;
+use crate::theme::{ActiveTheme, MotionPreference};
 
 #[derive(IntoElement)]
 pub struct ProgressBar {
@@ -38,8 +39,18 @@ impl RenderOnce for ProgressBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let accent = theme.accent;
+        let reduce_motion = cx.reduce_motion();
 
+        // Report as a progress indicator. Determinate bars carry a 0–100 value;
+        // the indeterminate sweep is value-less (the work has no known fraction).
         let track = div()
+            .id(self.id.clone())
+            .role(Role::ProgressIndicator)
+            .when(!self.indeterminate, |t| {
+                t.aria_numeric_value((self.fraction * 100.0) as f64)
+                    .aria_min_numeric_value(0.0)
+                    .aria_max_numeric_value(100.0)
+            })
             .relative()
             .h(px(4.0))
             .w_full()
@@ -49,22 +60,29 @@ impl RenderOnce for ProgressBar {
 
         if self.indeterminate {
             // A 40%-wide segment sweeps from off-screen-left to off-screen-right.
-            track.child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .h_full()
-                    .w(relative(0.4))
-                    .rounded(px(3.0))
-                    .bg(accent)
-                    .with_animation(
+            // Under a reduced-motion preference the sweep is distracting and
+            // unhelpful, so we drop the animation and rest the segment centered
+            // as a static "working…" indicator instead.
+            let segment = div()
+                .absolute()
+                .top_0()
+                .h_full()
+                .w(relative(0.4))
+                .rounded(px(3.0))
+                .bg(accent);
+            if reduce_motion {
+                track.child(segment.left(relative(0.3)))
+            } else {
+                track.child(
+                    segment.with_animation(
                         self.id,
                         Animation::new(Duration::from_millis(1100))
                             .repeat()
                             .with_easing(ease_in_out),
                         |segment, delta| segment.left(relative(-0.4 + 1.4 * delta)),
                     ),
-            )
+                )
+            }
         } else {
             track.child(
                 div()

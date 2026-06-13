@@ -11,7 +11,7 @@
 //! Domain-free by design — it takes a generic [`Highlighter`] callback (the SQL
 //! tokenizer lives in RED) and an optional [`CompletionProvider`] seam (RED feeds
 //! candidates from its introspected schema). The editor knows nothing about SQL.
-//! Deferred: soft-wrap, undo, `tree-sitter`, horizontal scroll for long lines.
+//! Deferred: soft-wrap, `tree-sitter`, horizontal scroll for long lines.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -20,7 +20,7 @@ use gpui::{
     actions, div, fill, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context,
     CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -53,8 +53,40 @@ actions!(
         Copy,
         Cut,
         Paste,
+        Undo,
+        Redo,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
+        DocStart,
+        DocEnd,
+        SelectDocStart,
+        SelectDocEnd,
     ]
 );
+
+/// How many undo steps the editor retains. Older steps drop off the bottom.
+const UNDO_LIMIT: usize = 200;
+
+/// A point-in-time editor state, captured before an edit so undo can restore it.
+#[derive(Clone)]
+struct EditSnapshot {
+    content: String,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+/// What an edit was, so consecutive same-kind edits coalesce into one undo step
+/// (typing a word is one undo, not one-per-keystroke). `Other` never coalesces.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    Insert,
+    Delete,
+    Other,
+}
 
 /// A token class the editor maps to a theme color. Generic (no SQL knowledge);
 /// the caller's [`Highlighter`] produces these.
@@ -128,6 +160,17 @@ pub struct CodeEditor {
     highlighter: Option<Highlighter>,
     completion_provider: Option<CompletionProvider>,
     completion: Option<Completion>,
+    /// Accessible name reported to assistive technology (default "Code editor").
+    a11y_label: SharedString,
+    /// Undo/redo stacks of pre-edit snapshots. `undo` pops the most recent prior
+    /// state; `redo` replays states undone since the last edit (cleared on a fresh
+    /// edit). `last_edit` drives coalescing — see [`EditKind`].
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
+    last_edit: EditKind,
+    /// Caret offset just after the last recorded edit; an edit contiguous with it
+    /// extends the current undo run instead of starting a new one.
+    last_edit_caret: usize,
     // Cached from the last paint, for hit-testing between paints.
     last_bounds: Option<Bounds<Pixels>>,
     last_lines: Vec<ShapedLine>,
@@ -149,6 +192,11 @@ impl CodeEditor {
             highlighter: None,
             completion_provider: None,
             completion: None,
+            a11y_label: SharedString::from("Code editor"),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: EditKind::Other,
+            last_edit_caret: 0,
             last_bounds: None,
             last_lines: Vec::new(),
             last_line_height: px(0.),
@@ -165,6 +213,13 @@ impl CodeEditor {
     /// `px(0.)` for square corners — e.g. an editor that fills a pane flush.
     pub fn corner_radius(mut self, radius: Pixels) -> Self {
         self.corner_radius = Some(radius);
+        self
+    }
+
+    /// The accessible name reported to assistive technology (default
+    /// "Code editor"). Set it to the editor's role in context, e.g. "Query editor".
+    pub fn a11y_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_label = label.into();
         self
     }
 
@@ -207,9 +262,15 @@ impl CodeEditor {
     /// Replace the whole buffer (e.g. loading a query from history). Caret goes to
     /// the end; any open completion is dismissed.
     pub fn set_content(&mut self, content: impl Into<String>, cx: &mut Context<Self>) {
-        self.content = content.into();
+        let content = content.into();
+        // A wholesale replace (e.g. loading a query) is one undo step on its own.
+        if content != self.content {
+            self.record_undo(EditKind::Other);
+        }
+        self.content = content;
         let end = self.content.len();
         self.selected_range = end..end;
+        self.last_edit_caret = end;
         self.completion = None;
         cx.notify();
     }
@@ -241,13 +302,35 @@ impl CodeEditor {
             KeyBinding::new("tab", InsertTab, ctx),
             KeyBinding::new("escape", Escape, ctx),
         ]);
+        // Word/line/document navigation and clipboard. macOS uses cmd for
+        // clipboard + line/doc jumps and alt for word jumps; Windows/Linux use
+        // ctrl for word jumps and ctrl-home/end for the document ends.
         #[cfg(target_os = "macos")]
         cx.bind_keys([
             KeyBinding::new("cmd-a", SelectAll, ctx),
             KeyBinding::new("cmd-c", Copy, ctx),
             KeyBinding::new("cmd-v", Paste, ctx),
             KeyBinding::new("cmd-x", Cut, ctx),
+            KeyBinding::new("cmd-z", Undo, ctx),
+            KeyBinding::new("cmd-shift-z", Redo, ctx),
             KeyBinding::new("cmd-enter", Run, ctx),
+            // ⌘← / ⌘→ jump to the line's start / end (reusing Home / End).
+            KeyBinding::new("cmd-left", Home, ctx),
+            KeyBinding::new("cmd-right", End, ctx),
+            KeyBinding::new("cmd-shift-left", SelectHome, ctx),
+            KeyBinding::new("cmd-shift-right", SelectEnd, ctx),
+            // ⌘↑ / ⌘↓ jump to the document's start / end.
+            KeyBinding::new("cmd-up", DocStart, ctx),
+            KeyBinding::new("cmd-down", DocEnd, ctx),
+            KeyBinding::new("cmd-shift-up", SelectDocStart, ctx),
+            KeyBinding::new("cmd-shift-down", SelectDocEnd, ctx),
+            // ⌥← / ⌥→ jump by word; ⌥⌫ / ⌥⌦ delete by word.
+            KeyBinding::new("alt-left", WordLeft, ctx),
+            KeyBinding::new("alt-right", WordRight, ctx),
+            KeyBinding::new("alt-shift-left", SelectWordLeft, ctx),
+            KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
+            KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
+            KeyBinding::new("alt-delete", DeleteWordRight, ctx),
         ]);
         #[cfg(not(target_os = "macos"))]
         cx.bind_keys([
@@ -255,7 +338,22 @@ impl CodeEditor {
             KeyBinding::new("ctrl-c", Copy, ctx),
             KeyBinding::new("ctrl-v", Paste, ctx),
             KeyBinding::new("ctrl-x", Cut, ctx),
+            KeyBinding::new("ctrl-z", Undo, ctx),
+            KeyBinding::new("ctrl-y", Redo, ctx),
+            KeyBinding::new("ctrl-shift-z", Redo, ctx),
             KeyBinding::new("ctrl-enter", Run, ctx),
+            // Ctrl+← / Ctrl+→ jump by word; Ctrl+⌫ / Ctrl+Del delete by word.
+            KeyBinding::new("ctrl-left", WordLeft, ctx),
+            KeyBinding::new("ctrl-right", WordRight, ctx),
+            KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
+            KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
+            KeyBinding::new("ctrl-backspace", DeleteWordLeft, ctx),
+            KeyBinding::new("ctrl-delete", DeleteWordRight, ctx),
+            // Ctrl+Home / Ctrl+End jump to the document's start / end.
+            KeyBinding::new("ctrl-home", DocStart, ctx),
+            KeyBinding::new("ctrl-end", DocEnd, ctx),
+            KeyBinding::new("ctrl-shift-home", SelectDocStart, ctx),
+            KeyBinding::new("ctrl-shift-end", SelectDocEnd, ctx),
         ]);
     }
 
@@ -504,6 +602,81 @@ impl CodeEditor {
         self.select_to(self.content.len(), cx);
     }
 
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.move_to(self.prev_word_boundary(self.cursor_offset()), cx);
+    }
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.move_to(self.next_word_boundary(self.cursor_offset()), cx);
+    }
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.select_to(self.prev_word_boundary(self.cursor_offset()), cx);
+    }
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.select_to(self.next_word_boundary(self.cursor_offset()), cx);
+    }
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let prev = self.prev_word_boundary(self.cursor_offset());
+            if prev == self.cursor_offset() {
+                return;
+            }
+            self.select_to(prev, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            let next = self.next_word_boundary(self.cursor_offset());
+            if next == self.cursor_offset() {
+                return;
+            }
+            self.select_to(next, cx);
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+    fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.move_to(0, cx);
+    }
+    fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.move_to(self.content.len(), cx);
+    }
+    fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.select_to(0, cx);
+    }
+    fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.desired_col = None;
+        self.select_to(self.content.len(), cx);
+    }
+
+    /// Start of the nearest word *before* `offset` (mac ⌥←, Linux Ctrl+←).
+    fn prev_word_boundary(&self, offset: usize) -> usize {
+        self.content
+            .unicode_word_indices()
+            .rev()
+            .find_map(|(idx, _)| (idx < offset).then_some(idx))
+            .unwrap_or(0)
+    }
+    /// End of the nearest word *after* `offset` (mac ⌥→, Linux Ctrl+→).
+    fn next_word_boundary(&self, offset: usize) -> usize {
+        self.content
+            .unicode_word_indices()
+            .map(|(idx, word)| idx + word.len())
+            .find(|&end| end > offset)
+            .unwrap_or(self.content.len())
+    }
+
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             let prev = self.prev_boundary(self.cursor_offset());
@@ -570,6 +743,88 @@ impl CodeEditor {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace_text_in_range(None, &text, window, cx);
         }
+    }
+
+    /// Record the pre-edit state for undo, unless this edit coalesces with the
+    /// current run (same kind, contiguous caret). Call *before* mutating `content`.
+    /// Any edit invalidates the redo stack.
+    fn record_undo(&mut self, kind: EditKind) {
+        let caret = self.selected_range.start;
+        let contiguous = match kind {
+            // Typing extends a run when each char lands at the previous caret.
+            EditKind::Insert => self.selected_range.is_empty() && caret == self.last_edit_caret,
+            // Backspace (range.end == caret) and forward-delete both stay in-run.
+            EditKind::Delete => {
+                self.selected_range.end == self.last_edit_caret
+                    || self.selected_range.start == self.last_edit_caret
+            }
+            EditKind::Other => false,
+        };
+        if !(contiguous && kind == self.last_edit) {
+            self.undo_stack.push(EditSnapshot {
+                content: self.content.clone(),
+                selected_range: self.selected_range.clone(),
+                selection_reversed: self.selection_reversed,
+            });
+            if self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.remove(0);
+            }
+        }
+        self.last_edit = kind;
+        self.redo_stack.clear();
+    }
+
+    /// Classify an edit for undo coalescing from its range and replacement text.
+    fn edit_kind(range: &Range<usize>, new_text: &str) -> EditKind {
+        if new_text.is_empty() {
+            EditKind::Delete
+        } else if range.is_empty()
+            && !new_text.contains('\n')
+            && new_text.graphemes(true).count() == 1
+        {
+            EditKind::Insert
+        } else {
+            // Paste, newline, tab, or replacing a selection — each its own step.
+            EditKind::Other
+        }
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(EditSnapshot {
+                content: self.content.clone(),
+                selected_range: self.selected_range.clone(),
+                selection_reversed: self.selection_reversed,
+            });
+            self.apply_snapshot(prev);
+            cx.notify();
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(EditSnapshot {
+                content: self.content.clone(),
+                selected_range: self.selected_range.clone(),
+                selection_reversed: self.selection_reversed,
+            });
+            self.apply_snapshot(next);
+            cx.notify();
+        }
+    }
+
+    /// Restore a snapshot and break the coalescing run so the next keystroke
+    /// starts a fresh undo step. Drops any open completion and IME marking.
+    fn apply_snapshot(&mut self, snap: EditSnapshot) {
+        self.content = snap.content;
+        self.selected_range = snap.selected_range;
+        self.selection_reversed = snap.selection_reversed;
+        self.marked_range = None;
+        self.desired_col = None;
+        self.completion = None;
+        self.last_edit = EditKind::Other;
+        self.last_edit_caret = self.selected_range.start;
+        self.refresh_completions();
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -707,10 +962,14 @@ impl EntityInputHandler for CodeEditor {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        // Snapshot for undo before the buffer changes (coalescing consecutive
+        // typing / deletion into one step).
+        self.record_undo(Self::edit_kind(&range, new_text));
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         let caret = range.start + new_text.len();
         self.selected_range = caret..caret;
+        self.last_edit_caret = caret;
         self.marked_range = None;
         self.refresh_completions();
         cx.notify();
@@ -732,8 +991,14 @@ impl EntityInputHandler for CodeEditor {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        // IME composition snapshots once, when marking begins (not on every
+        // intermediate update of the same marked region).
+        if self.marked_range.is_none() {
+            self.record_undo(EditKind::Other);
+        }
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.last_edit_caret = range.start + new_text.len();
         self.marked_range =
             (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
         self.selected_range = new_selected_range_utf16
@@ -1071,6 +1336,11 @@ impl Render for CodeEditor {
             Some(floating(list).at(at))
         });
 
+        // A11y: a multi-line text-input node keyed off the focus handle. The
+        // editor content is read by assistive technology through the platform
+        // input handler registered in prepaint (`handle_input` above).
+        let a11y_id = ElementId::from(&self.focus_handle);
+        let a11y_label = self.a11y_label.clone();
         div()
             .relative()
             .flex()
@@ -1082,6 +1352,9 @@ impl Render for CodeEditor {
             .rounded(self.corner_radius.unwrap_or(theme.radius))
             .overflow_hidden()
             .key_context("CodeEditor")
+            .id(a11y_id)
+            .role(Role::MultilineTextInput)
+            .aria_label(a11y_label)
             .track_focus(&self.focus_handle(cx))
             .tab_index(0)
             .cursor(CursorStyle::IBeam)
@@ -1100,6 +1373,16 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::select_home))
             .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::doc_start))
+            .on_action(cx.listener(Self::doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::insert_tab))
             .on_action(cx.listener(Self::run))
@@ -1107,6 +1390,8 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

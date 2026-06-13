@@ -4,7 +4,7 @@
 //! Stateless: the caller owns the selected index, reacting via
 //! [`on_select`](Tabs::on_select).
 
-use gpui::{div, prelude::*, App, SharedString, Window};
+use gpui::{div, prelude::*, App, Role, SharedString, Window};
 
 use crate::styled_ext::StyledExt;
 use crate::theme::ActiveTheme;
@@ -94,6 +94,9 @@ impl RenderOnce for Tabs {
 
             div()
                 .id(ix)
+                .role(Role::Tab)
+                .aria_label(item.label.clone())
+                .aria_selected(is_active)
                 .flex()
                 .items_center()
                 .gap_1p5()
@@ -118,6 +121,7 @@ impl RenderOnce for Tabs {
 
         div()
             .id(self.id)
+            .role(Role::TabList)
             .flex()
             .items_center()
             .gap_0p5()

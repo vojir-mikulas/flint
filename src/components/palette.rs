@@ -259,7 +259,7 @@ impl Render for Palette {
         let text = theme.text;
         let text_faint = theme.text_faint;
         let accent = theme.accent;
-        let border_soft = theme.border_soft;
+        let border = theme.border;
         let bg_elevated = theme.bg_elevated;
         let font_family = theme.font_family.clone();
         let font_base = theme.font_size;
@@ -332,7 +332,7 @@ impl Render for Palette {
             .px(px(15.))
             .py(px(13.))
             .border_b_1()
-            .border_color(border_soft)
+            .border_color(border)
             .text_size(font_lg)
             .child(self.input.clone());
 
@@ -372,7 +372,7 @@ impl Render for Palette {
             .text_size(font_base)
             .bg(bg_elevated)
             .border_1()
-            .border_color(border_soft)
+            .border_color(border)
             .rounded(px(11.))
             .shadow_lg()
             .overflow_hidden()

@@ -10,8 +10,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, FontWeight, Pixels, SharedString,
-    Window,
+    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, FontWeight, Pixels, Role,
+    SharedString, Window,
 };
 
 use crate::components::floating::floating;
@@ -149,6 +149,9 @@ impl RenderOnce for Select {
 
         let trigger = div()
             .id(self.id.clone())
+            .role(Role::ComboBox)
+            .aria_label(current.clone())
+            .aria_expanded(open)
             .flex()
             .items_center()
             .gap_1p5()
@@ -221,6 +224,9 @@ impl RenderOnce for Select {
                 });
                 div()
                     .id(ix)
+                    .role(Role::ListBoxOption)
+                    .aria_label(label.clone())
+                    .aria_selected(is_selected)
                     .flex()
                     .items_center()
                     .gap_2()
@@ -246,6 +252,7 @@ impl RenderOnce for Select {
 
         let list = div()
             .id("select-menu")
+            .role(Role::ListBox)
             .occlude()
             .flex()
             .flex_col()
@@ -259,7 +266,7 @@ impl RenderOnce for Select {
             .text_size(item_size)
             .bg(theme.bg_elevated)
             .border_1()
-            .border_color(theme.border_strong)
+            .border_color(theme.border)
             .rounded(px(7.))
             .shadow_lg()
             .when_some(on_toggle, |this, toggle| {

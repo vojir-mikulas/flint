@@ -3,7 +3,7 @@
 //! `Toggle` - a binary on/off switch. Stateless: the caller owns the boolean,
 //! reacting via [`on_change`](Toggle::on_change).
 
-use gpui::{div, prelude::*, App, ElementId, Window};
+use gpui::{div, prelude::*, App, ElementId, Role, SharedString, Window};
 
 use crate::styled_ext::StyledExt;
 use crate::theme::ActiveTheme;
@@ -15,6 +15,7 @@ pub struct Toggle {
     id: ElementId,
     checked: bool,
     disabled: bool,
+    label: Option<SharedString>,
     on_change: Option<ChangeHandler>,
 }
 
@@ -24,12 +25,20 @@ impl Toggle {
             id: id.into(),
             checked,
             disabled: false,
+            label: None,
             on_change: None,
         }
     }
 
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Accessible name announced to assistive tech (the switch has no visible
+    /// text of its own). Set it to what the switch controls, e.g. "Read-only".
+    pub fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.label = Some(label.into());
         self
     }
 
@@ -60,8 +69,13 @@ impl RenderOnce for Toggle {
                 theme.text_muted
             });
 
+        let accent = theme.accent;
         let base = div()
             .id(self.id)
+            // A switch role with its accessible name, so screen readers announce
+            // it and its checked state rather than an anonymous box.
+            .role(Role::CheckBox)
+            .when_some(self.label, |this, label| this.aria_label(label))
             .flex()
             .items_center()
             .w(gpui::px(34.))
@@ -76,8 +90,12 @@ impl RenderOnce for Toggle {
 
         let next = !checked;
         match (self.disabled, self.on_change) {
+            // Focusable so Tab reaches it; GPUI fires the click on Enter/Space, so
+            // the focused switch toggles from the keyboard like a real checkbox.
             (false, Some(handler)) => base
                 .cursor_pointer()
+                .tab_index(0)
+                .focus(move |s| s.border_color(accent))
                 .on_click(move |_, window, cx| handler(&next, window, cx)),
             (false, None) => base.cursor_pointer(),
             (true, _) => base.disabled_look(),

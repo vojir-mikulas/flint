@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, point, prelude::*, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
-    ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, Pixels, Point, ScrollHandle,
+    ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, Pixels, Point, Role, ScrollHandle,
     ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window,
 };
 
@@ -251,6 +251,12 @@ pub struct Table<D: 'static = ()> {
     text_size: Option<Pixels>,
     /// Draw 1px separators between cells and rows (a spreadsheet look).
     grid_lines: bool,
+    /// Accessible name for the grid as a whole, reported on its focusable root
+    /// with a `Grid` role. Callers driving a cell cursor update this each frame
+    /// to the focused cell's "column: value" so assistive technology speaks the
+    /// cursor as it moves (the table owns no selection state). `None` leaves the
+    /// grid unnamed (still a `Grid` landmark).
+    a11y_label: Option<SharedString>,
 }
 
 impl<D: 'static> Table<D> {
@@ -290,7 +296,16 @@ impl<D: 'static> Table<D> {
             font_family: None,
             text_size: None,
             grid_lines: false,
+            a11y_label: None,
         }
+    }
+
+    /// Set the grid's accessible name. Drive this with the focused cell's
+    /// "column: value" (and row position) so assistive technology speaks the
+    /// cell cursor as it moves; see the field docs.
+    pub fn a11y_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_label = Some(label.into());
+        self
     }
 
     /// Render the header + cells in `family` (e.g. a monospace data grid).
@@ -684,6 +699,7 @@ impl<D: 'static> RenderOnce for Table<D> {
         let on_cell_secondary = self.on_cell_secondary.clone();
         let focus_handle = self.focus_handle.clone();
         let on_nav = self.on_nav.clone();
+        let a11y_label = self.a11y_label.clone();
 
         let list = uniform_list("table-rows", row_count, move |range, window, cx| {
             // Report the about-to-render window so a windowed source can fill the
@@ -921,7 +937,13 @@ impl<D: 'static> RenderOnce for Table<D> {
             // Keep a pure-vertical wheel from being redirected into x-scroll.
             hscroll.style().restrict_scroll_to_axis = Some(true);
 
-            let mut root = div().id(self.id).flex().flex_col().size_full();
+            let mut root = div()
+                .id(self.id)
+                .role(Role::Grid)
+                .when_some(a11y_label.clone(), |d, label| d.aria_label(label))
+                .flex()
+                .flex_col()
+                .size_full();
 
             // The horizontal track and the vertical `uniform_list` are two
             // independent scroll containers, so GPUI's per-container axis lock
@@ -983,6 +1005,8 @@ impl<D: 'static> RenderOnce for Table<D> {
         } else {
             div()
                 .id(self.id)
+                .role(Role::Grid)
+                .when_some(a11y_label.clone(), |d, label| d.aria_label(label))
                 .flex()
                 .flex_col()
                 .size_full()

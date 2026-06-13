@@ -3,7 +3,7 @@
 //! `IconButton` - a compact square icon-only button. Takes its glyph as a
 //! generic `impl IntoElement` child (never an icon enum), staying domain-free.
 
-use gpui::{div, prelude::*, AnyElement, App, ClickEvent, ElementId, SharedString, Window};
+use gpui::{div, prelude::*, AnyElement, App, ClickEvent, ElementId, Role, SharedString, Window};
 
 use crate::components::tooltip::Tooltip;
 use crate::styled_ext::StyledExt;
@@ -39,6 +39,7 @@ pub struct IconButton {
     disabled: bool,
     on_click: Option<ClickHandler>,
     tooltip: Option<SharedString>,
+    a11y_label: Option<SharedString>,
 }
 
 impl IconButton {
@@ -51,12 +52,26 @@ impl IconButton {
             disabled: false,
             on_click: None,
             tooltip: None,
+            a11y_label: None,
         }
     }
 
     /// A hover tooltip (e.g. the action's name + its keyboard shortcut).
+    ///
+    /// The tooltip text also seeds the accessible name when no explicit
+    /// [`a11y_label`](Self::a11y_label) is set — an icon-only button is opaque
+    /// to assistive technology otherwise, since a tooltip is hover-only and
+    /// never exposed to AT. Prefer a tooltip on every icon button.
     pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
         self.tooltip = Some(text.into());
+        self
+    }
+
+    /// The accessible name reported to assistive technology. Set this when the
+    /// tooltip carries a keyboard hint you don't want spoken (e.g. tooltip
+    /// "Settings  ⌘," → a11y_label "Settings"), or when there is no tooltip.
+    pub fn a11y_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_label = Some(label.into());
         self
     }
 
@@ -100,8 +115,14 @@ impl RenderOnce for IconButton {
         let ring = theme.accent;
         let glow = theme.accent_ghost;
 
+        // Accessible name: explicit override, else the tooltip text. Without one
+        // an icon-only button is an unnamed control to a screen reader.
+        let a11y_name = self.a11y_label.clone().or_else(|| self.tooltip.clone());
         let base = div()
             .id(self.id)
+            .role(Role::Button)
+            .when_some(a11y_name, |d, name| d.aria_label(name))
+            .when(self.active, |d| d.aria_selected(true))
             .flex()
             .items_center()
             .justify_center()

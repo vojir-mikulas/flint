@@ -6,7 +6,7 @@
 //! for long-running operations like an export). Both stay domain-free — the
 //! caller owns the lifecycle, IDs, and timers.
 
-use gpui::{div, prelude::*, relative, App, Hsla, SharedString, Window};
+use gpui::{div, prelude::*, relative, App, ElementId, Hsla, Role, SharedString, Window};
 
 use crate::theme::ActiveTheme;
 
@@ -23,6 +23,7 @@ pub enum ToastVariant {
 
 #[derive(IntoElement)]
 pub struct Toast {
+    id: Option<ElementId>,
     message: SharedString,
     variant: ToastVariant,
     on_close: Option<CloseHandler>,
@@ -32,11 +33,21 @@ pub struct Toast {
 impl Toast {
     pub fn new(message: impl Into<SharedString>) -> Self {
         Self {
+            id: None,
             message: message.into(),
             variant: ToastVariant::default(),
             on_close: None,
             progress: None,
         }
+    }
+
+    /// A stable id for this toast. Required for the toast to be reported to
+    /// assistive technology as a live region: without it the card carries no
+    /// accessibility node (and stacking several un-id'd toasts would otherwise
+    /// collide on a global id). Pass the caller's own notification id.
+    pub fn id(mut self, id: impl Into<ElementId>) -> Self {
+        self.id = Some(id.into());
+        self
     }
 
     pub fn variant(mut self, variant: ToastVariant) -> Self {
@@ -71,6 +82,22 @@ impl RenderOnce for Toast {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let dot = dot_color(self.variant, theme);
+        // Errors/warnings persist and demand attention → assertive `Alert`.
+        // Info/success are advisory → polite `Status`. (The pinned GPUI rev has
+        // no explicit live-region setter; these roles carry implicit live
+        // semantics on the platforms that support it.)
+        let a11y_role = match self.variant {
+            ToastVariant::Warning | ToastVariant::Error => Role::Alert,
+            ToastVariant::Info | ToastVariant::Success => Role::Status,
+        };
+        let a11y_message = self.message.clone();
+        // A toast is reported to assistive technology only when the caller gave
+        // it an id (so stacked toasts can't collide on a global id). The id is
+        // also needed for the stateful node `.role()` lives on; without one we
+        // fall back to a constant id and skip the role, leaving it out of the
+        // a11y tree entirely.
+        let report = self.id.is_some();
+        let card_id: ElementId = self.id.clone().unwrap_or_else(|| "toast".into());
 
         let row = div()
             .flex()
@@ -88,6 +115,8 @@ impl RenderOnce for Toast {
                 row.child(
                     div()
                         .id("toast-close")
+                        .role(Role::Button)
+                        .aria_label("Dismiss")
                         .flex()
                         .items_center()
                         .justify_center()
@@ -105,6 +134,8 @@ impl RenderOnce for Toast {
             });
 
         div()
+            .id(card_id)
+            .when(report, |card| card.role(a11y_role).aria_label(a11y_message))
             .flex()
             .flex_col()
             .gap_2()

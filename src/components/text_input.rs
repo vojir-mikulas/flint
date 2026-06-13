@@ -13,7 +13,8 @@ use gpui::{
     Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, Focusable, GlobalElementId, InspectorElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window,
+    Role, ShapedLine, SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle,
+    Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -48,8 +49,30 @@ actions!(
         Paste,
         Cut,
         Copy,
+        Undo,
+        Redo,
     ]
 );
+
+/// How many undo steps the field retains. Older steps drop off the bottom.
+const UNDO_LIMIT: usize = 100;
+
+/// A point-in-time field state, captured before an edit so undo can restore it.
+#[derive(Clone)]
+struct EditSnapshot {
+    content: SharedString,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+}
+
+/// What an edit was, so consecutive same-kind edits coalesce into one undo step.
+/// `Other` never coalesces.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    Insert,
+    Delete,
+    Other,
+}
 
 /// Emitted so the owner can react via `cx.subscribe` - the field can't know
 /// whether submit means *create folder* or *save profile*.
@@ -90,6 +113,12 @@ pub struct TextInput {
     /// Borderless, transparent-background variant for embedding in a styled
     /// container (e.g. a command palette's input row). The parent owns the chrome.
     bare: bool,
+    /// Undo/redo stacks of pre-edit snapshots; `last_edit`/`last_edit_caret` drive
+    /// coalescing so typing a word is one undo step. See [`EditKind`].
+    undo_stack: Vec<EditSnapshot>,
+    redo_stack: Vec<EditSnapshot>,
+    last_edit: EditKind,
+    last_edit_caret: usize,
 }
 
 /// The glyph each character is shown as in an [obscured](TextInput::obscured)
@@ -115,6 +144,10 @@ impl TextInput {
             // Tab stop by default so `window.focus_next/prev` walks form fields.
             tab_stop: true,
             bare: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: EditKind::Other,
+            last_edit_caret: 0,
         }
     }
 
@@ -181,6 +214,12 @@ impl TextInput {
         self.selected_range = end..end;
         self.selection_reversed = false;
         self.marked_range = None;
+        // A programmatic reset (form populate / field mirror) starts fresh — undo
+        // shouldn't reach back across it into a prior field's value.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = EditKind::Other;
+        self.last_edit_caret = end;
         cx.notify();
     }
 
@@ -223,6 +262,8 @@ impl TextInput {
             KeyBinding::new("cmd-c", Copy, ctx),
             KeyBinding::new("cmd-v", Paste, ctx),
             KeyBinding::new("cmd-x", Cut, ctx),
+            KeyBinding::new("cmd-z", Undo, ctx),
+            KeyBinding::new("cmd-shift-z", Redo, ctx),
             KeyBinding::new("cmd-left", Home, ctx),
             KeyBinding::new("cmd-right", End, ctx),
             KeyBinding::new("cmd-shift-left", SelectHome, ctx),
@@ -242,6 +283,9 @@ impl TextInput {
             KeyBinding::new("ctrl-c", Copy, ctx),
             KeyBinding::new("ctrl-v", Paste, ctx),
             KeyBinding::new("ctrl-x", Cut, ctx),
+            KeyBinding::new("ctrl-z", Undo, ctx),
+            KeyBinding::new("ctrl-y", Redo, ctx),
+            KeyBinding::new("ctrl-shift-z", Redo, ctx),
         ]);
     }
 
@@ -432,6 +476,81 @@ impl TextInput {
         }
     }
 
+    /// Record the pre-edit state for undo, unless this edit coalesces with the
+    /// current run (same kind, contiguous caret). Call *before* mutating `content`.
+    fn record_undo(&mut self, kind: EditKind) {
+        let caret = self.selected_range.start;
+        let contiguous = match kind {
+            EditKind::Insert => self.selected_range.is_empty() && caret == self.last_edit_caret,
+            EditKind::Delete => {
+                self.selected_range.end == self.last_edit_caret
+                    || self.selected_range.start == self.last_edit_caret
+            }
+            EditKind::Other => false,
+        };
+        if !(contiguous && kind == self.last_edit) {
+            self.undo_stack.push(EditSnapshot {
+                content: self.content.clone(),
+                selected_range: self.selected_range.clone(),
+                selection_reversed: self.selection_reversed,
+            });
+            if self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.remove(0);
+            }
+        }
+        self.last_edit = kind;
+        self.redo_stack.clear();
+    }
+
+    /// Classify an edit for undo coalescing from its range and replacement text.
+    fn edit_kind(range: &Range<usize>, new_text: &str) -> EditKind {
+        if new_text.is_empty() {
+            EditKind::Delete
+        } else if range.is_empty() && new_text.graphemes(true).count() == 1 {
+            EditKind::Insert
+        } else {
+            EditKind::Other
+        }
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(EditSnapshot {
+                content: self.content.clone(),
+                selected_range: self.selected_range.clone(),
+                selection_reversed: self.selection_reversed,
+            });
+            self.apply_snapshot(prev);
+            cx.notify();
+            cx.emit(TextInputEvent::Change);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(EditSnapshot {
+                content: self.content.clone(),
+                selected_range: self.selected_range.clone(),
+                selection_reversed: self.selection_reversed,
+            });
+            self.apply_snapshot(next);
+            cx.notify();
+            cx.emit(TextInputEvent::Change);
+        }
+    }
+
+    /// Restore a snapshot and break the coalescing run so the next keystroke
+    /// starts a fresh undo step.
+    fn apply_snapshot(&mut self, snap: EditSnapshot) {
+        let len = snap.content.len();
+        self.content = snap.content;
+        self.selected_range = snap.selected_range.clone();
+        self.selection_reversed = snap.selection_reversed;
+        self.marked_range = None;
+        self.last_edit = EditKind::Other;
+        self.last_edit_caret = snap.selected_range.start.min(len);
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         cx.notify();
@@ -606,10 +725,14 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // Snapshot before the buffer changes; coalesces consecutive typing /
+        // deletion into one undo step.
+        self.record_undo(Self::edit_kind(&range, new_text));
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.last_edit_caret = self.selected_range.start;
         self.marked_range.take();
         cx.notify();
         cx.emit(TextInputEvent::Change);
@@ -629,9 +752,14 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // IME composition snapshots once, when marking begins.
+        if self.marked_range.is_none() {
+            self.record_undo(EditKind::Other);
+        }
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
+        self.last_edit_caret = range.start + new_text.len();
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
@@ -972,8 +1100,18 @@ impl Render for TextInput {
                 .text_size(cx.theme().font_size)
                 .text_color(cx.theme().text)
         };
+        // A11y: a text-input node keyed off the focus handle (unique per field,
+        // stable across frames). The field's text *value* is read by assistive
+        // technology through the platform input handler the inner `TextElement`
+        // registers (see `handle_input` below); the placeholder seeds the name
+        // for fields without an externally-provided label.
+        let a11y_id = ElementId::from(&self.focus_handle);
+        let placeholder = self.placeholder.clone();
         let mut field = field
             .key_context("TextInput")
+            .id(a11y_id)
+            .role(Role::TextInput)
+            .when(!placeholder.is_empty(), |this| this.aria_label(placeholder))
             .track_focus(&self.focus_handle(cx))
             .when(self.tab_stop, |this| this.tab_index(0))
             .cursor(CursorStyle::IBeam)
@@ -1002,6 +1140,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

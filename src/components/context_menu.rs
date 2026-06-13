@@ -144,7 +144,7 @@ impl RenderOnce for ContextMenu {
             .text_size(theme.font_size)
             .bg(theme.bg_elevated)
             .border_1()
-            .border_color(theme.border_strong)
+            .border_color(theme.border)
             .rounded(gpui::px(7.))
             .shadow_lg()
             .children(rows)

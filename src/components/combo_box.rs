@@ -17,7 +17,7 @@
 
 use gpui::{
     actions, canvas, div, point, prelude::*, px, AnyElement, App, Bounds, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyBinding, Pixels, SharedString, Window,
+    EventEmitter, FocusHandle, Focusable, KeyBinding, Pixels, Role, SharedString, Window,
 };
 
 use crate::components::floating::floating;
@@ -311,6 +311,9 @@ impl Render for ComboBox {
         };
         let trigger = div()
             .id(self.id.clone())
+            .role(Role::ComboBox)
+            .aria_label(current_label.clone())
+            .aria_expanded(open)
             .flex()
             .items_center()
             .gap_1p5()
@@ -394,6 +397,9 @@ impl Render for ComboBox {
                 let check = is_current.then(|| active_check.take()).flatten();
                 div()
                     .id(("combo-row", row_ix))
+                    .role(Role::ListBoxOption)
+                    .aria_label(self.options[f.option].clone())
+                    .aria_selected(is_current)
                     .flex()
                     .items_center()
                     .gap_2p5()
@@ -427,6 +433,7 @@ impl Render for ComboBox {
         } else {
             div()
                 .id("combo-list")
+                .role(Role::ListBox)
                 .flex()
                 .flex_col()
                 .gap(px(1.))
@@ -443,7 +450,7 @@ impl Render for ComboBox {
             .px(px(12.))
             .py(px(9.))
             .border_b_1()
-            .border_color(theme.border_soft)
+            .border_color(theme.border)
             .text_size(font_sm)
             .child(self.input.clone());
 
@@ -457,7 +464,7 @@ impl Render for ComboBox {
             .text_size(font_sm)
             .bg(theme.bg_elevated)
             .border_1()
-            .border_color(theme.border_strong)
+            .border_color(theme.border)
             .rounded(px(10.))
             .shadow_lg()
             .overflow_hidden()

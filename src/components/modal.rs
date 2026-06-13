@@ -5,8 +5,8 @@
 //! behind a [`gpui::deferred`] layer) so it paints above the rest of the UI.
 
 use gpui::{
-    actions, div, prelude::*, AnyElement, App, ElementId, FocusHandle, KeyBinding, SharedString,
-    Window,
+    actions, div, prelude::*, AnyElement, App, ElementId, FocusHandle, KeyBinding, Role,
+    SharedString, Window,
 };
 
 use crate::scrim::ScrimDismiss;
@@ -113,6 +113,8 @@ impl RenderOnce for Modal {
         let on_close = self.on_close.map(std::rc::Rc::new);
         let on_confirm = self.on_confirm.map(std::rc::Rc::new);
         let focus_handle = self.focus_handle;
+        // The dialog's accessible name, reported on the panel's `Dialog` node.
+        let a11y_title = self.title.clone();
 
         let header = self.title.map(|title| {
             let close = on_close.clone();
@@ -123,7 +125,7 @@ impl RenderOnce for Modal {
                 .px_4()
                 .py_3p5()
                 .border_b_1()
-                .border_color(theme.border_soft)
+                .border_color(theme.border)
                 .child(
                     div()
                         .flex_1()
@@ -135,6 +137,8 @@ impl RenderOnce for Modal {
                 .child(
                     div()
                         .id("modal-close")
+                        .role(Role::Button)
+                        .aria_label("Close")
                         .flex()
                         .items_center()
                         .justify_center()
@@ -163,7 +167,7 @@ impl RenderOnce for Modal {
                 .px_4()
                 .py_3()
                 .border_t_1()
-                .border_color(theme.border_soft)
+                .border_color(theme.border)
                 .bg(theme.bg_bar)
                 // Match the panel's rounding so the bar's own fill doesn't paint
                 // sharp corners into the rounded bottom (overflow_hidden clips
@@ -173,6 +177,11 @@ impl RenderOnce for Modal {
         });
 
         let panel = div()
+            .id("modal-panel")
+            // A dialog landmark with the title as its accessible name, so screen
+            // readers announce the modal on open and offer it to rotor navigation.
+            .role(Role::Dialog)
+            .when_some(a11y_title, |this, title| this.aria_label(title))
             .occlude()
             .flex()
             .flex_col()
@@ -182,7 +191,7 @@ impl RenderOnce for Modal {
             .text_size(theme.font_size)
             .bg(theme.bg_elevated)
             .border_1()
-            .border_color(theme.border_strong)
+            .border_color(theme.border)
             .rounded(gpui::px(9.))
             .shadow_lg()
             .overflow_hidden()

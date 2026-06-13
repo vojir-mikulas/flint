@@ -31,6 +31,18 @@ actions!(flint_switcher, [SelectNext, SelectPrev]);
 /// Caller-supplied so Flint stays domain-free (RED hands in its lucide SVGs).
 type IconFn = Box<dyn Fn(&App) -> AnyElement + 'static>;
 
+/// How prominent the trigger's resting (closed) border is. Resolved to a theme
+/// token at render time so it re-themes correctly — defaults to [`Self::Soft`],
+/// the original subtle look. Use [`Self::Normal`] to match a host's other
+/// bordered controls (e.g. RED's topbar buttons).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TriggerBorder {
+    #[default]
+    Soft,
+    Normal,
+    Strong,
+}
+
 /// A small pill drawn on the right of a row, e.g. a connection's warm/cold state.
 #[derive(Clone, Debug)]
 pub struct SwitcherBadge {
@@ -152,6 +164,8 @@ pub struct Switcher {
     /// Trigger label and its leading dot (e.g. the active connection).
     trigger_label: SharedString,
     trigger_dot: Option<Hsla>,
+    /// Emphasis of the trigger's resting border (defaults to a subtle hairline).
+    trigger_border: TriggerBorder,
     /// Trigger disclosure glyph; falls back to a unicode chevron when unset.
     chevron: Option<IconFn>,
 }
@@ -187,6 +201,7 @@ impl Switcher {
             needs_focus: false,
             trigger_label: "Switch…".into(),
             trigger_dot: None,
+            trigger_border: TriggerBorder::default(),
             chevron: None,
         }
     }
@@ -217,6 +232,13 @@ impl Switcher {
     ) {
         self.trigger_label = label.into();
         self.trigger_dot = dot;
+        cx.notify();
+    }
+
+    /// How prominent the trigger's resting border is. Defaults to a subtle
+    /// hairline; raise it to sit alongside a host's other bordered controls.
+    pub fn set_trigger_border(&mut self, emphasis: TriggerBorder, cx: &mut Context<Self>) {
+        self.trigger_border = emphasis;
         cx.notify();
     }
 
@@ -404,7 +426,11 @@ impl Render for Switcher {
             .border_color(if open {
                 theme.border_strong
             } else {
-                theme.border_soft
+                match self.trigger_border {
+                    TriggerBorder::Soft => theme.border_soft,
+                    TriggerBorder::Normal => theme.border,
+                    TriggerBorder::Strong => theme.border_strong,
+                }
             })
             .when(open, |s| s.bg(theme.bg_active))
             .text_size(theme.font_size)
@@ -566,7 +592,7 @@ impl Render for Switcher {
                 .gap(px(1.))
                 .p(px(6.))
                 .border_t_1()
-                .border_color(theme.border_soft)
+                .border_color(theme.border)
                 .children(
                     self.footer
                         .iter()
@@ -581,7 +607,7 @@ impl Render for Switcher {
             .px(px(12.))
             .py(px(9.))
             .border_b_1()
-            .border_color(theme.border_soft)
+            .border_color(theme.border)
             .text_size(font_base)
             .child(self.input.clone());
 
@@ -595,7 +621,7 @@ impl Render for Switcher {
             .text_size(font_base)
             .bg(theme.bg_elevated)
             .border_1()
-            .border_color(theme.border_strong)
+            .border_color(theme.border)
             .rounded(px(10.))
             .shadow_lg()
             .overflow_hidden()

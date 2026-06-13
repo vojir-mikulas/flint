@@ -126,3 +126,24 @@ impl ActiveTheme for App {
         self.global::<Theme>()
     }
 }
+
+/// Whether the user (or their OS) prefers reduced motion. When set, animated
+/// components fall back to a static rendering. Stored as a [`Global`] so a
+/// component can honor it without the preference being threaded through every
+/// call site; defaults to `false` (animate) when the host app never sets it.
+#[derive(Clone, Copy, Default)]
+pub struct ReduceMotion(pub bool);
+
+impl Global for ReduceMotion {}
+
+/// Accessor for the [`ReduceMotion`] preference; implemented for [`App`] so
+/// `cx.reduce_motion()` works in `render` whether or not the host set it.
+pub trait MotionPreference {
+    fn reduce_motion(&self) -> bool;
+}
+
+impl MotionPreference for App {
+    fn reduce_motion(&self) -> bool {
+        self.try_global::<ReduceMotion>().is_some_and(|rm| rm.0)
+    }
+}

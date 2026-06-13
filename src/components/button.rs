@@ -5,7 +5,7 @@
 
 use gpui::{
     div, point, prelude::*, px, AnyElement, App, BoxShadow, ClickEvent, ElementId, FocusHandle,
-    Hsla, SharedString, Window,
+    Hsla, Role, SharedString, Window,
 };
 
 use crate::components::tooltip::Tooltip;
@@ -42,6 +42,7 @@ pub struct Button {
     focus_handle: Option<FocusHandle>,
     on_click: Option<ClickHandler>,
     tooltip: Option<SharedString>,
+    a11y_label: Option<SharedString>,
 }
 
 impl Button {
@@ -60,12 +61,21 @@ impl Button {
             focus_handle: None,
             on_click: None,
             tooltip: None,
+            a11y_label: None,
         }
     }
 
     /// A hover tooltip (e.g. the action's name + its keyboard shortcut).
     pub fn tooltip(mut self, text: impl Into<SharedString>) -> Self {
         self.tooltip = Some(text.into());
+        self
+    }
+
+    /// Override the accessible name reported to assistive technology. Defaults
+    /// to the visible label; set this when the label alone is ambiguous out of
+    /// context (e.g. an icon-led button) or when no text label is shown.
+    pub fn a11y_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.a11y_label = Some(label.into());
         self
     }
 
@@ -150,8 +160,16 @@ impl RenderOnce for Button {
         // Sm scales text and horizontal padding down too — not just height — so a
         // small button reads as small next to compact chrome (e.g. a toolbar's
         // 11px labels), rather than oversized 14px text in a short box.
+        // Accessible name: explicit override, else the visible label. Reported
+        // on the button node itself so screen readers announce "<name>, button".
+        let a11y_name = self
+            .a11y_label
+            .clone()
+            .unwrap_or_else(|| self.label.clone());
         let base = div()
             .id(self.id)
+            .role(Role::Button)
+            .aria_label(a11y_name)
             .flex()
             .items_center()
             .justify_center()
