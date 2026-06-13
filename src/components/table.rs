@@ -950,9 +950,9 @@ impl<D: 'static> RenderOnce for Table<D> {
             // never sees both axes at once — a trackpad swipe's minor-axis jitter
             // leaks into the other container and the grid drifts diagonally. This
             // capture-phase overlay arbitrates across both: it picks the dominant
-            // axis per scroll event and, when one clearly dominates, drives only
-            // that handle and swallows the event; a true diagonal (within 2:1)
-            // falls through so the native handlers still move both axes.
+            // axis per scroll event, drives only that handle, and swallows the
+            // event — so every mixed-axis swipe is locked to one axis and the grid
+            // can't drift diagonally.
             if let (Some(h), Some(v)) = (self.h_scroll_handle.clone(), self.scroll_handle.clone()) {
                 let v = v.0.borrow().base_handle.clone();
                 root = root.relative().child(
@@ -975,13 +975,15 @@ impl<D: 'static> RenderOnce for Table<D> {
                                     if ax.is_zero() || ay.is_zero() {
                                         return;
                                     }
-                                    const LOCK_RATIO: f32 = 2.0;
-                                    if ax > ay * LOCK_RATIO {
+                                    // Any mixed-axis wheel locks to whichever axis
+                                    // dominates and swallows the event, so a swipe
+                                    // only ever moves one axis — no diagonal drift.
+                                    // A tie breaks toward vertical (the common
+                                    // reading direction).
+                                    if ax > ay {
                                         h.set_offset(h.offset() + point(delta.x, gpui::px(0.)));
-                                    } else if ay > ax * LOCK_RATIO {
-                                        v.set_offset(v.offset() + point(gpui::px(0.), delta.y));
                                     } else {
-                                        return; // diagonal: let both axes move
+                                        v.set_offset(v.offset() + point(gpui::px(0.), delta.y));
                                     }
                                     cx.stop_propagation();
                                     cx.notify(view);

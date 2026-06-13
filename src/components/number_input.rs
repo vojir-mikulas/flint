@@ -46,10 +46,12 @@ impl NumberInput {
         // The middle is a bare field: no chrome of its own, no tab stop (the box
         // owns the focus ring; Tab should skip straight past the stepper), and the
         // value sits centered between the steppers.
+        // A tab stop so Tab reaches the typeable field (the steppers are mouse-only);
+        // landing here focuses the number for direct entry, Enter/blur commits.
         let input = cx.new(|cx| {
             TextInput::new(cx)
                 .bare()
-                .tab_stop(false)
+                .tab_stop(true)
                 .align(TextAlign::Center)
         });
 

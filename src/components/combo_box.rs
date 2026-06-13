@@ -92,7 +92,10 @@ impl ComboBox {
 
         Self {
             id: id.into(),
-            focus_handle: cx.focus_handle(),
+            // A tab stop so Tab reaches the closed trigger (which tracks this handle),
+            // and the shared ancestor of the open popover's search field — so one
+            // `is_focused` check covers the combo in either state.
+            focus_handle: cx.focus_handle().tab_stop(true),
             input,
             options: Vec::new(),
             current: None,
@@ -121,6 +124,13 @@ impl ComboBox {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Whether the combo holds keyboard focus — either the closed trigger, or the
+    /// open popover's search field (a descendant of the shared focus handle). Lets
+    /// an owner react to the combo being focused (e.g. scroll it into view).
+    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.focus_handle.contains_focused(window, cx)
     }
 
     /// Text shown in the trigger when nothing is selected.
@@ -336,6 +346,12 @@ impl Render for ComboBox {
                 theme.text_faint
             })
             .cursor_pointer()
+            // Tab reaches the closed trigger via the shared focus handle (a tab
+            // stop); GPUI fires the click on Enter/Space, so the focused combo opens
+            // from the keyboard. Tracked only while closed — when open the popover
+            // owns the handle and the search field holds focus.
+            .when(!open, |this| this.track_focus(&self.focus_handle))
+            .focus(|s| s.border_color(theme.accent))
             .child(div().child(current_label))
             .child(chevron)
             .child(

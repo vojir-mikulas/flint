@@ -618,7 +618,12 @@ impl CodeEditor {
         self.desired_col = None;
         self.select_to(self.next_word_boundary(self.cursor_offset()), cx);
     }
-    fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_word_left(
+        &mut self,
+        _: &DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.selected_range.is_empty() {
             let prev = self.prev_word_boundary(self.cursor_offset());
             if prev == self.cursor_offset() {

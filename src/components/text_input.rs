@@ -128,7 +128,12 @@ const OBSCURE_GLYPH: &str = "•";
 impl TextInput {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
-            focus_handle: cx.focus_handle(),
+            // Tab order rides on the focus handle, NOT the rendered div: GPUI only
+            // copies a div's `tab_index`/`tab_stop` onto an *auto-created* handle,
+            // never onto one we track explicitly (`track_focus`). So a div-level
+            // `.tab_index(0)` is silently dropped for our field and the input would
+            // never be a tab stop — set it on the handle, where `focus_next` reads.
+            focus_handle: cx.focus_handle().tab_stop(true),
             content: SharedString::default(),
             placeholder: SharedString::default(),
             selected_range: 0..0,
@@ -155,6 +160,9 @@ impl TextInput {
     /// standalone fields like a search box that shouldn't be in the tab ring.
     pub fn tab_stop(mut self, tab_stop: bool) -> Self {
         self.tab_stop = tab_stop;
+        // Keep the handle in sync — it's the source of truth for tab order (see
+        // `new`), so a standalone field opting out must clear it here too.
+        self.focus_handle = self.focus_handle.clone().tab_stop(tab_stop);
         self
     }
 
@@ -1112,8 +1120,9 @@ impl Render for TextInput {
             .id(a11y_id)
             .role(Role::TextInput)
             .when(!placeholder.is_empty(), |this| this.aria_label(placeholder))
+            // The handle carries the tab-stop flag (set in `new`/`tab_stop`); a
+            // div-level `.tab_index` here would be ignored for a tracked handle.
             .track_focus(&self.focus_handle(cx))
-            .when(self.tab_stop, |this| this.tab_index(0))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
