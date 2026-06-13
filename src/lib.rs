@@ -7,6 +7,7 @@
 //! app (Nyx, RED, …). Map domain types to generic props *in the app*.
 
 pub mod components;
+pub mod scrim;
 pub mod styled_ext;
 pub mod theme;
 
@@ -45,6 +46,7 @@ pub use components::toast::{Toast, ToastVariant};
 pub use components::toggle::Toggle;
 pub use components::tooltip::Tooltip;
 pub use components::tree::{Tree, TreeItem, TreeNav};
+pub use scrim::ScrimDismiss;
 pub use styled_ext::StyledExt;
 pub use theme::{ActiveTheme, Theme};
 
@@ -79,6 +81,7 @@ pub mod prelude {
     pub use crate::components::toggle::Toggle;
     pub use crate::components::tooltip::Tooltip;
     pub use crate::components::tree::{Tree, TreeItem, TreeNav};
+    pub use crate::scrim::ScrimDismiss;
     pub use crate::styled_ext::StyledExt;
     pub use crate::theme::{ActiveTheme, Theme};
 }

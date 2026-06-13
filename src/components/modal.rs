@@ -5,10 +5,11 @@
 //! behind a [`gpui::deferred`] layer) so it paints above the rest of the UI.
 
 use gpui::{
-    actions, div, prelude::*, AnyElement, App, ElementId, FocusHandle, KeyBinding, MouseButton,
-    SharedString, Window,
+    actions, div, prelude::*, AnyElement, App, ElementId, FocusHandle, KeyBinding, SharedString,
+    Window,
 };
 
+use crate::scrim::ScrimDismiss;
 use crate::theme::ActiveTheme;
 
 // Tab navigation within a focused modal. Scoped to the `Modal` key context (set
@@ -237,7 +238,10 @@ impl RenderOnce for Modal {
                     )
             })
             .when_some(on_close, |this, close| {
-                this.on_mouse_down(MouseButton::Left, move |_, window, cx| close(window, cx))
+                // Dismiss on a backdrop click — but not the click that ends a
+                // window drag begun on the scrim (grabbing the title bar behind
+                // the modal must move the window, not close it). See `ScrimDismiss`.
+                this.on_scrim_dismiss(move |window, cx| close(window, cx))
             })
             .child(panel)
     }

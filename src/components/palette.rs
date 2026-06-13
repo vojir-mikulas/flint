@@ -18,6 +18,7 @@ use gpui::{
 
 use crate::components::fuzzy::{fuzzy_match, highlighted_label};
 use crate::components::text_input::{TextInput, TextInputEvent};
+use crate::scrim::ScrimDismiss;
 use crate::theme::ActiveTheme;
 
 actions!(flint_palette, [SelectNext, SelectPrev]);
@@ -153,6 +154,15 @@ impl Palette {
     pub fn set_placeholder(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.input
             .update(cx, |input, cx| input.set_placeholder(text, cx));
+    }
+
+    /// Prefill the field's text (e.g. a prompt that edits an existing value, so a
+    /// small tweak is one keystroke). In a command palette this also re-filters.
+    pub fn set_query(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |input, cx| input.set_content(text, cx));
+        self.refilter(cx);
+        cx.notify();
     }
 
     /// Replace the command list and re-filter against the current query.
@@ -387,10 +397,14 @@ impl Render for Palette {
             .pt(gpui::relative(0.11))
             .bg(gpui::black().opacity(0.45))
             .occlude()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.emit(PaletteEvent::Dismiss)),
-            )
+            // A backdrop click dismisses — but not the click that ends a window
+            // drag begun on the scrim (see `ScrimDismiss`).
+            .on_scrim_dismiss({
+                let this = cx.entity().downgrade();
+                move |_, cx| {
+                    this.update(cx, |_, cx| cx.emit(PaletteEvent::Dismiss)).ok();
+                }
+            })
             .child(panel)
     }
 }
