@@ -386,7 +386,10 @@ impl CodeEditor {
 
     // --- cursor / selection primitives (mirrors TextInput) ---
 
-    fn cursor_offset(&self) -> usize {
+    /// The caret's byte offset into [`content`](Self::content) (the selection's
+    /// active end). Lets a host scope an action to the caret — e.g. running just
+    /// the statement under the cursor.
+    pub fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start
         } else {
