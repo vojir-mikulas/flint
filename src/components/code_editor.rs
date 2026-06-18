@@ -157,6 +157,11 @@ pub struct CodeEditor {
     /// Corner radius of the editor frame; `None` uses `theme.radius`. `Some(px(0.))`
     /// gives square corners (see [`Self::corner_radius`]).
     corner_radius: Option<Pixels>,
+    /// Whether to draw the resting (unfocused) frame border. `false` keeps the 1px
+    /// box but makes it transparent while unfocused, for editors embedded in an
+    /// already-bordered container (see [`Self::resting_border`]). The focus border
+    /// is always drawn.
+    resting_border: bool,
     highlighter: Option<Highlighter>,
     completion_provider: Option<CompletionProvider>,
     completion: Option<Completion>,
@@ -189,6 +194,7 @@ impl CodeEditor {
             read_only: false,
             desired_col: None,
             corner_radius: None,
+            resting_border: true,
             highlighter: None,
             completion_provider: None,
             completion: None,
@@ -213,6 +219,16 @@ impl CodeEditor {
     /// `px(0.)` for square corners — e.g. an editor that fills a pane flush.
     pub fn corner_radius(mut self, radius: Pixels) -> Self {
         self.corner_radius = Some(radius);
+        self
+    }
+
+    /// Whether to draw the resting (unfocused) frame border (default: `true`). Pass
+    /// `false` when the editor already sits inside a bordered container, so its own
+    /// border doesn't double up — the focus border is still drawn so focus stays
+    /// visible, and the 1px box is preserved (just transparent) to avoid a layout
+    /// shift on focus.
+    pub fn resting_border(mut self, show: bool) -> Self {
+        self.resting_border = show;
         self
     }
 
@@ -1356,7 +1372,13 @@ impl Render for CodeEditor {
             .size_full()
             .bg(theme.bg_app)
             .border_1()
-            .border_color(if focused { theme.accent } else { theme.border })
+            .border_color(if focused {
+                theme.accent
+            } else if self.resting_border {
+                theme.border
+            } else {
+                gpui::transparent_black()
+            })
             .rounded(self.corner_radius.unwrap_or(theme.radius))
             .overflow_hidden()
             .key_context("CodeEditor")
