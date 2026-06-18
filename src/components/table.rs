@@ -193,6 +193,11 @@ type PreviewFn = Box<dyn Fn(&mut Window, &mut App) -> gpui::AnyElement + 'static
 /// Queried only for visible rows, so it stays O(1) even for huge listings - the
 /// caller never materializes a set spanning every row.
 type RowPredicate = Rc<dyn Fn(usize) -> bool + 'static>;
+/// Per-cell background tint `(row, col) -> Option<Hsla>`, painted under the cell
+/// (below the selection highlight, which still wins). Queried only for visible
+/// cells. Lets a caller mark cells by state - a staged/dirty edit, a row pending
+/// deletion - without the table knowing what the states mean.
+type CellBackground = Rc<dyn Fn(usize, usize) -> Option<gpui::Hsla> + 'static>;
 
 /// Wraps a caller-built element as the floating in-app drag preview view -
 /// GPUI's `on_drag` requires an `Entity<impl Render>`, so we box the builder.
@@ -236,6 +241,7 @@ pub struct Table<D: 'static = ()> {
     h_scroll_handle: Option<ScrollHandle>,
     on_visible_range: Option<VisibleRangeHandler>,
     selected_cells: Option<CellRange>,
+    cell_bg: Option<CellBackground>,
     on_cell_click: Option<CellClickHandler>,
     on_cell_secondary: Option<CellSecondaryHandler>,
     focus_handle: Option<FocusHandle>,
@@ -288,6 +294,7 @@ impl<D: 'static> Table<D> {
             h_scroll_handle: None,
             on_visible_range: None,
             selected_cells: None,
+            cell_bg: None,
             on_cell_click: None,
             on_cell_secondary: None,
             focus_handle: None,
@@ -330,6 +337,15 @@ impl<D: 'static> Table<D> {
     /// The current cell selection to highlight (caller-owned).
     pub fn selected_cells(mut self, range: Option<CellRange>) -> Self {
         self.selected_cells = range;
+        self
+    }
+
+    /// Per-cell background tint `(row, col) -> Option<Hsla>`, painted under the
+    /// cell (the selection highlight still wins on top). Queried only for visible
+    /// cells, so it's O(1) per frame regardless of result size. Use it to mark a
+    /// staged edit, a row pending deletion, etc. — the table stays state-agnostic.
+    pub fn cell_bg(mut self, bg: impl Fn(usize, usize) -> Option<gpui::Hsla> + 'static) -> Self {
+        self.cell_bg = Some(Rc::new(bg));
         self
     }
 
@@ -695,6 +711,7 @@ impl<D: 'static> RenderOnce for Table<D> {
         let text = theme.text;
 
         let selected_cells = self.selected_cells;
+        let cell_bg = self.cell_bg.clone();
         let on_cell_click = self.on_cell_click.clone();
         let on_cell_secondary = self.on_cell_secondary.clone();
         let focus_handle = self.focus_handle.clone();
@@ -731,6 +748,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                     let column = &columns_for_rows[c];
                     let is_cell_selected =
                         selected_cells.is_some_and(|range| range.contains(ix, c));
+                    let cell_tint = cell_bg.as_ref().and_then(|f| f(ix, c));
                     let on_cell_click = on_cell_click.clone();
                     let on_cell_secondary = on_cell_secondary.clone();
                     cell_layout(
@@ -750,6 +768,9 @@ impl<D: 'static> RenderOnce for Table<D> {
                             .px_2p5()
                             .overflow_hidden()
                             .when(grid_lines, |d| d.border_r_1().border_color(line))
+                            // A caller-supplied state tint paints first; the
+                            // selection highlight still wins on top of it.
+                            .when_some(cell_tint, |d, tint| d.bg(tint))
                             .when(is_cell_selected, |d| d.bg(cell_selected))
                             .when_some(on_cell_click, |d, handler| {
                                 d.cursor_pointer().on_click(move |event, window, cx| {
