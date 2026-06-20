@@ -21,7 +21,7 @@ use gpui::{
     CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -47,6 +47,7 @@ actions!(
         SelectEnd,
         SelectAll,
         Newline,
+        SoftNewline,
         InsertTab,
         Run,
         Escape,
@@ -125,12 +126,22 @@ pub type Highlighter = Rc<dyn Fn(&str) -> Vec<(Range<usize>, TokenStyle)>>;
 /// keyword candidates; the editor never knows what a "table" is.
 pub type CompletionProvider = Rc<dyn Fn(&str, usize) -> Vec<SharedString>>;
 
+/// An optional companion to the [`CompletionProvider`]: maps a candidate string to
+/// a short dim label shown beside it in the popup (e.g. a slash command's
+/// description, or a column's type). Still domain-free — the editor only renders
+/// whatever string the owner returns. `None` (the default) shows bare candidates.
+pub type CompletionDetail = Rc<dyn Fn(&str) -> Option<SharedString>>;
+
 /// Emitted so the owner reacts to editor-level keys without the editor knowing
 /// what they mean.
 #[derive(Clone, Copy, Debug)]
 pub enum CodeEditorEvent {
     /// ⌘↵ — the owner runs the buffer / selection.
     Run,
+    /// Enter in a [`submit_on_enter`](CodeEditor::submit_on_enter) editor with no
+    /// completion popup open — the owner sends/confirms (e.g. a chat composer).
+    /// A plain multiline editor never emits this.
+    Submit,
     /// Esc with no completion popup open — the owner can move focus elsewhere
     /// (the completion-dismiss case is handled internally and emits nothing).
     Escape,
@@ -152,6 +163,20 @@ pub struct CodeEditor {
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
     read_only: bool,
+    /// Dim prompt text shown when the buffer is empty (e.g. "Ask a question…").
+    /// Purely a hint — never part of [`content`](Self::content). Empty by default.
+    placeholder: SharedString,
+    /// Whether to draw the line-number gutter (default `true`). Off for a prose
+    /// surface like a chat composer, where line numbers are noise.
+    gutter: bool,
+    /// Whether Enter sends rather than inserting a line (default `false`). On, a
+    /// bare Enter (no completion popup) emits [`CodeEditorEvent::Submit`] and
+    /// Shift+Enter inserts a newline — the chat-composer convention.
+    submit_on_enter: bool,
+    /// Soft-wrap long lines to the editor width instead of scrolling horizontally
+    /// (default `false`). For a prose surface like a chat composer. Off keeps the
+    /// code-editor behaviour (one shaped line per logical line, horizontal scroll).
+    soft_wrap: bool,
     /// Preserved column for vertical navigation, in bytes within a line.
     desired_col: Option<usize>,
     /// Corner radius of the editor frame; `None` uses `theme.radius`. `Some(px(0.))`
@@ -164,6 +189,8 @@ pub struct CodeEditor {
     resting_border: bool,
     highlighter: Option<Highlighter>,
     completion_provider: Option<CompletionProvider>,
+    /// Optional dim label shown beside each candidate (see [`CompletionDetail`]).
+    completion_detail: Option<CompletionDetail>,
     completion: Option<Completion>,
     /// Accessible name reported to assistive technology (default "Code editor").
     a11y_label: SharedString,
@@ -179,6 +206,9 @@ pub struct CodeEditor {
     // Cached from the last paint, for hit-testing between paints.
     last_bounds: Option<Bounds<Pixels>>,
     last_lines: Vec<ShapedLine>,
+    /// Cached wrapped lines from the last paint (soft-wrap mode only), for
+    /// wrap-aware hit-testing. Empty when `soft_wrap` is off.
+    last_wrapped: Vec<WrappedLine>,
     last_line_height: Pixels,
 }
 
@@ -192,11 +222,16 @@ impl CodeEditor {
             marked_range: None,
             is_selecting: false,
             read_only: false,
+            placeholder: SharedString::default(),
+            gutter: true,
+            submit_on_enter: false,
+            soft_wrap: false,
             desired_col: None,
             corner_radius: None,
             resting_border: true,
             highlighter: None,
             completion_provider: None,
+            completion_detail: None,
             completion: None,
             a11y_label: SharedString::from("Code editor"),
             undo_stack: Vec::new(),
@@ -205,6 +240,7 @@ impl CodeEditor {
             last_edit_caret: 0,
             last_bounds: None,
             last_lines: Vec::new(),
+            last_wrapped: Vec::new(),
             last_line_height: px(0.),
         }
     }
@@ -239,6 +275,36 @@ impl CodeEditor {
         self
     }
 
+    /// Dim placeholder text shown while the buffer is empty (default: none).
+    pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    /// Whether to draw the line-number gutter (default `true`). Pass `false` for a
+    /// prose surface — a chat composer, a comment box — where numbers are noise.
+    pub fn gutter(mut self, show: bool) -> Self {
+        self.gutter = show;
+        self
+    }
+
+    /// Make Enter send rather than insert a line (default off). With it on, a bare
+    /// Enter with no completion popup emits [`CodeEditorEvent::Submit`] and
+    /// Shift+Enter inserts a newline — the chat-composer convention. Leave it off
+    /// for a code surface, where Enter always inserts a line.
+    pub fn submit_on_enter(mut self, submit: bool) -> Self {
+        self.submit_on_enter = submit;
+        self
+    }
+
+    /// Soft-wrap long lines to the editor width instead of scrolling horizontally
+    /// (default off). For a prose surface — a chat composer, a comment box. Leave it
+    /// off for code, where horizontal scroll preserves column alignment.
+    pub fn soft_wrap(mut self, wrap: bool) -> Self {
+        self.soft_wrap = wrap;
+        self
+    }
+
     pub fn highlighter(
         mut self,
         f: impl Fn(&str) -> Vec<(Range<usize>, TokenStyle)> + 'static,
@@ -263,6 +329,17 @@ impl CodeEditor {
     ) {
         self.completion_provider = Some(Rc::new(f));
         cx.notify();
+    }
+
+    /// Attach a dim detail label to each candidate in the popup (see
+    /// [`CompletionDetail`]) — e.g. a slash command's description. Optional; without
+    /// it the popup shows bare candidate strings.
+    pub fn completion_detail(
+        mut self,
+        f: impl Fn(&str) -> Option<SharedString> + 'static,
+    ) -> Self {
+        self.completion_detail = Some(Rc::new(f));
+        self
     }
 
     pub fn content(&self) -> String {
@@ -315,6 +392,9 @@ impl CodeEditor {
             KeyBinding::new("shift-home", SelectHome, ctx),
             KeyBinding::new("shift-end", SelectEnd, ctx),
             KeyBinding::new("enter", Newline, ctx),
+            // Shift+Enter always inserts a line — the soft-newline a
+            // `submit_on_enter` composer needs, and harmless in a code surface.
+            KeyBinding::new("shift-enter", SoftNewline, ctx),
             KeyBinding::new("tab", InsertTab, ctx),
             KeyBinding::new("escape", Escape, ctx),
         ]);
@@ -479,7 +559,12 @@ impl CodeEditor {
         if start < cursor {
             return Some(start);
         }
-        (start > 0 && bytes[start - 1] == b'.').then_some(cursor)
+        // Empty-word triggers: a `.` (member access) or a `/` (slash command) right
+        // before the cursor offers completion before any suffix is typed, so the
+        // popup opens the instant the user types the trigger. The provider decides
+        // whether there's anything to show, so non-completion uses (SQL division,
+        // file paths) simply yield no popup.
+        (start > 0 && matches!(bytes[start - 1], b'.' | b'/')).then_some(cursor)
     }
 
     /// Recompute the completion popup against the provider. Called after edits.
@@ -726,6 +811,17 @@ impl CodeEditor {
         if self.accept_completion(cx) {
             return;
         }
+        // In a composer, a bare Enter sends instead of inserting a line; the
+        // owner reacts to `Submit`. Shift+Enter (a separate action) still inserts.
+        if self.submit_on_enter {
+            cx.emit(CodeEditorEvent::Submit);
+            return;
+        }
+        self.desired_col = None;
+        self.replace_text_in_range(None, "\n", window, cx);
+    }
+    /// Shift+Enter: always insert a newline, regardless of `submit_on_enter`.
+    fn soft_newline(&mut self, _: &SoftNewline, window: &mut Window, cx: &mut Context<Self>) {
         self.desired_col = None;
         self.replace_text_in_range(None, "\n", window, cx);
     }
@@ -876,8 +972,30 @@ impl CodeEditor {
             return 0;
         };
         let ranges = self.line_ranges();
-        let lh = f32::from(self.last_line_height).max(1.0);
+        let line_height = self.last_line_height;
+        let lh = f32::from(line_height).max(1.0);
         let y_rel = f32::from(position.y - bounds.top()).max(0.0);
+
+        // Soft-wrap: a logical line can span several visual rows, so walk the cached
+        // wrapped lines by their stacked heights and let GPUI map the local point to
+        // a byte index within the line (it accounts for the wrap rows).
+        if self.soft_wrap && !self.last_wrapped.is_empty() {
+            let mut top = 0.0_f32;
+            for (line, wl) in self.last_wrapped.iter().enumerate() {
+                let h = f32::from(wl.size(line_height).height).max(lh);
+                let range = ranges.get(line).cloned().unwrap_or(0..self.content.len());
+                if y_rel < top + h || line + 1 == self.last_wrapped.len() {
+                    let local = point(position.x - bounds.left(), px(y_rel - top));
+                    let col = wl
+                        .closest_index_for_position(local, line_height)
+                        .unwrap_or_else(|e| e);
+                    return (range.start + col).min(range.end);
+                }
+                top += h;
+            }
+            return self.content.len();
+        }
+
         let mut line = (y_rel / lh) as usize;
         if line >= ranges.len() {
             line = ranges.len() - 1;
@@ -1072,6 +1190,10 @@ struct CodeElement {
 
 struct PrepaintState {
     lines: Vec<ShapedLine>,
+    /// Soft-wrap mode: one wrapped layout per logical line, paired with its top
+    /// offset. Empty when `soft_wrap` is off (then `lines` is used).
+    wrapped: Vec<WrappedLine>,
+    tops: Vec<Pixels>,
     line_height: Pixels,
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
@@ -1102,10 +1224,28 @@ impl Element for CodeElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let line_count = self.editor.read(cx).content.split('\n').count().max(1);
+        let editor = self.editor.read(cx);
+        let line_height = window.line_height();
+        let line_count = editor.content.split('\n').count().max(1);
+        // Soft-wrap height depends on the available width. We don't have this frame's
+        // width yet, so reuse the previous paint's width to count visual rows; on the
+        // first frame (no cached width) fall back to the logical line count, which the
+        // next frame corrects. The visual-row count is an upper bound on logical
+        // lines, so the scroll container never under-sizes for long content.
+        let rows = if editor.soft_wrap {
+            match editor.last_bounds {
+                Some(b) if b.size.width > px(0.) => {
+                    visual_row_count(&editor.content, b.size.width, line_height, window)
+                        .max(line_count)
+                }
+                _ => line_count,
+            }
+        } else {
+            line_count
+        };
         let mut style = Style::default();
         style.size.width = gpui::relative(1.).into();
-        style.size.height = (window.line_height() * line_count as f32).into();
+        style.size.height = (line_height * rows as f32).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -1138,6 +1278,126 @@ impl Element for CodeElement {
         let font = text_style.font();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
+
+        // --- soft-wrap path: one wrapped layout per logical line, stacked ---
+        if editor.soft_wrap {
+            // Runs over the whole content (token colors; gaps default), as shape_text
+            // splits on newlines itself and wants runs covering the full text.
+            let mut runs: Vec<TextRun> = Vec::new();
+            let mut pos = 0usize;
+            for (tr, style) in &tokens {
+                let s = tr.start.min(content.len());
+                let e = tr.end.min(content.len());
+                if s >= e || s < pos {
+                    continue;
+                }
+                if s > pos {
+                    runs.push(text_run(s - pos, &font, default_color));
+                }
+                runs.push(text_run(e - s, &font, style.color(&theme)));
+                pos = e;
+            }
+            if pos < content.len() {
+                runs.push(text_run(content.len() - pos, &font, default_color));
+            }
+            if runs.is_empty() {
+                runs.push(text_run(content.len(), &font, default_color));
+            }
+
+            let wrap_width = bounds.size.width;
+            let wrapped: Vec<WrappedLine> = window
+                .text_system()
+                .shape_text(
+                    SharedString::from(content.clone()),
+                    font_size,
+                    &runs,
+                    Some(wrap_width),
+                    None,
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+
+            // Top offset of each logical line (its predecessors' wrapped heights).
+            let mut tops: Vec<Pixels> = Vec::with_capacity(wrapped.len());
+            let mut acc = px(0.);
+            for wl in &wrapped {
+                tops.push(acc);
+                acc += wl.size(line_height).height;
+            }
+
+            // Caret, mapped through the wrapped layout (visual row + x within it).
+            let (cline, ccol) = line_col(&ranges, cursor);
+            let caret = wrapped.get(cline).map(|wl| {
+                let local = wl
+                    .position_for_index(ccol, line_height)
+                    .unwrap_or(point(px(0.), px(0.)));
+                fill(
+                    Bounds::new(
+                        point(
+                            bounds.left() + local.x,
+                            bounds.top() + tops[cline] + local.y,
+                        ),
+                        size(px(2.), line_height),
+                    ),
+                    cursor_color,
+                )
+            });
+
+            // Selection: a block per spanned logical line, split across visual rows.
+            let mut selections = Vec::new();
+            if !selected.is_empty() {
+                let (s_line, s_col) = line_col(&ranges, selected.start);
+                let (e_line, e_col) = line_col(&ranges, selected.end);
+                let right = bounds.left() + wrap_width;
+                // Indexing `wrapped`/`ranges`/`tops` by the same logical-line number.
+                #[allow(clippy::needless_range_loop)]
+                for line in s_line..=e_line {
+                    let Some(wl) = wrapped.get(line) else {
+                        continue;
+                    };
+                    let line_len = ranges.get(line).map(Range::len).unwrap_or(0);
+                    let start_col = if line == s_line { s_col } else { 0 };
+                    let end_col = if line == e_line { e_col } else { line_len };
+                    let p0 = wl
+                        .position_for_index(start_col, line_height)
+                        .unwrap_or(point(px(0.), px(0.)));
+                    let p1 = wl
+                        .position_for_index(end_col, line_height)
+                        .unwrap_or(point(px(0.), px(0.)));
+                    let line_top = bounds.top() + tops[line];
+                    let mut quad = |x0: Pixels, x1: Pixels, row_y: Pixels| {
+                        selections.push(fill(
+                            Bounds::from_corners(
+                                point(x0, line_top + row_y),
+                                point(x1, line_top + row_y + line_height),
+                            ),
+                            selection_color,
+                        ));
+                    };
+                    if p0.y == p1.y {
+                        quad(bounds.left() + p0.x, bounds.left() + p1.x, p0.y);
+                    } else {
+                        quad(bounds.left() + p0.x, right, p0.y);
+                        let mut y = p0.y + line_height;
+                        while y < p1.y {
+                            quad(bounds.left(), right, y);
+                            y += line_height;
+                        }
+                        quad(bounds.left(), bounds.left() + p1.x, p1.y);
+                    }
+                }
+            }
+
+            return PrepaintState {
+                lines: Vec::new(),
+                wrapped,
+                tops,
+                line_height,
+                cursor: caret,
+                selections,
+            };
+        }
 
         // Shape each line with per-token colored runs (gaps fall back to default).
         let mut lines = Vec::with_capacity(ranges.len());
@@ -1213,6 +1473,8 @@ impl Element for CodeElement {
 
         PrepaintState {
             lines,
+            wrapped: Vec::new(),
+            tops: Vec::new(),
             line_height,
             cursor: Some(caret),
             selections,
@@ -1242,9 +1504,18 @@ impl Element for CodeElement {
 
         let line_height = prepaint.line_height;
         let lines = std::mem::take(&mut prepaint.lines);
-        for (i, line) in lines.iter().enumerate() {
-            let origin = point(bounds.left(), bounds.top() + line_height * i as f32);
-            let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+        let wrapped = std::mem::take(&mut prepaint.wrapped);
+        let tops = std::mem::take(&mut prepaint.tops);
+        if wrapped.is_empty() {
+            for (i, line) in lines.iter().enumerate() {
+                let origin = point(bounds.left(), bounds.top() + line_height * i as f32);
+                let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+            }
+        } else {
+            for (i, line) in wrapped.iter().enumerate() {
+                let origin = point(bounds.left(), bounds.top() + tops[i]);
+                let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+            }
         }
 
         if focus_handle.is_focused(window) {
@@ -1256,6 +1527,7 @@ impl Element for CodeElement {
         self.editor.update(cx, |editor, _| {
             editor.last_bounds = Some(bounds);
             editor.last_lines = lines;
+            editor.last_wrapped = wrapped;
             editor.last_line_height = line_height;
         });
     }
@@ -1270,6 +1542,40 @@ fn text_run(len: usize, font: &gpui::Font, color: Hsla) -> TextRun {
         underline: None,
         strikethrough: None,
     }
+}
+
+/// Total visual rows `content` occupies when soft-wrapped to `wrap_width`: the sum
+/// over logical lines of (wrap boundaries + 1). Used to size the soft-wrap element's
+/// height. Color is irrelevant here — only the wrap geometry matters.
+fn visual_row_count(
+    content: &str,
+    wrap_width: Pixels,
+    _line_height: Pixels,
+    window: &mut Window,
+) -> usize {
+    if content.is_empty() {
+        return 1;
+    }
+    let text_style = window.text_style();
+    let font = text_style.font();
+    let font_size = text_style.font_size.to_pixels(window.rem_size());
+    let color = text_style.color;
+    let runs = [text_run(content.len(), &font, color)];
+    let wrapped = window
+        .text_system()
+        .shape_text(
+            SharedString::from(content.to_string()),
+            font_size,
+            &runs,
+            Some(wrap_width),
+            None,
+        )
+        .unwrap_or_default();
+    wrapped
+        .iter()
+        .map(|wl| wl.wrap_boundaries().len() + 1)
+        .sum::<usize>()
+        .max(1)
 }
 
 /// Free version of [`CodeEditor::line_col`] over precomputed ranges, for the
@@ -1301,35 +1607,54 @@ impl Render for CodeEditor {
         let border = theme.border_soft;
 
         // Line-number gutter (plain divs; scrolls with the code as a flex sibling).
-        let gutter = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(border)
-            .children((1..=line_count).map(|n| {
-                div()
-                    .h(line_height)
-                    .min_w(px(48.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .text_color(gutter_fg)
-                    .child(n.to_string())
-            }));
-
-        let scroll_area =
+        // Suppressed on a prose surface (see [`Self::gutter`]).
+        let gutter = self.gutter.then(|| {
             div()
-                .id("code-scroll")
-                .flex_1()
-                .overflow_y_scroll()
-                .py_2()
-                .child(div().flex().items_start().child(gutter).child(
-                    div().flex_1().pl_3().child(CodeElement {
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .border_r_1()
+                .border_color(border)
+                .children((1..=line_count).map(|n| {
+                    div()
+                        .h(line_height)
+                        .min_w(px(48.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .text_color(gutter_fg)
+                        .child(n.to_string())
+                }))
+        });
+
+        let scroll_area = div()
+            .id("code-scroll")
+            .flex_1()
+            .overflow_y_scroll()
+            .py_2()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .when_some(gutter, |row, g| row.child(g))
+                    .child(div().flex_1().pl_3().child(CodeElement {
                         editor: cx.entity(),
-                    }),
-                ));
+                    })),
+            );
+
+        // Dim placeholder, shown only while the buffer is empty. An overlay (the
+        // frame is `relative`) aligned to where the first glyph paints, so it never
+        // perturbs layout or the input handler.
+        let placeholder = (self.content.is_empty() && !self.placeholder.is_empty()).then(|| {
+            let left = if self.gutter { px(60.) } else { px(12.) };
+            div()
+                .absolute()
+                .top(px(8.))
+                .left(left)
+                .text_color(theme.text_dim)
+                .child(self.placeholder.clone())
+        });
 
         let focused = self.focus_handle.is_focused(window);
 
@@ -1348,13 +1673,30 @@ impl Render for CodeEditor {
                 .py_1()
                 .child(div().flex().flex_col().children(
                     c.candidates.iter().take(8).enumerate().map(|(i, cand)| {
+                        let detail = self
+                            .completion_detail
+                            .as_ref()
+                            .and_then(|f| f(cand));
                         div()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
                             .px_2()
                             .py_0p5()
                             .text_size(px(12.))
                             .text_color(theme.text)
                             .when(i == c.selected, |d| d.bg(theme.bg_selected))
                             .child(cand.clone())
+                            .when_some(detail, |d, label| {
+                                d.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .text_size(px(11.))
+                                        .text_color(theme.text_muted)
+                                        .child(label),
+                                )
+                            })
                     }),
                 ));
             Some(floating(list).at(at))
@@ -1414,6 +1756,7 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::select_doc_start))
             .on_action(cx.listener(Self::select_doc_end))
             .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::soft_newline))
             .on_action(cx.listener(Self::insert_tab))
             .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::escape))
@@ -1426,6 +1769,9 @@ impl Render for CodeEditor {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            // Placeholder first so the (transparent) scroll area paints over it and
+            // still wins mouse hits — the empty editor stays clickable to focus.
+            .children(placeholder)
             .child(scroll_area)
             .children(popup)
     }
