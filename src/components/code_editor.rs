@@ -21,7 +21,7 @@ use gpui::{
     CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, WrappedLine,
+    ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -203,6 +203,13 @@ pub struct CodeEditor {
     /// Caret offset just after the last recorded edit; an edit contiguous with it
     /// extends the current undo run instead of starting a new one.
     last_edit_caret: usize,
+    /// Drives the scroll container so caret-follow autoscroll can read the viewport
+    /// and nudge the offset when the caret lands outside it.
+    scroll_handle: ScrollHandle,
+    /// Set by an edit or caret move; the next paint scrolls the caret back into view
+    /// (then clears it). Gating on this — rather than scrolling every frame — lets the
+    /// user wheel-scroll away from the caret without it snapping back.
+    scroll_to_cursor: bool,
     // Cached from the last paint, for hit-testing between paints.
     last_bounds: Option<Bounds<Pixels>>,
     last_lines: Vec<ShapedLine>,
@@ -238,6 +245,8 @@ impl CodeEditor {
             redo_stack: Vec::new(),
             last_edit: EditKind::Other,
             last_edit_caret: 0,
+            scroll_handle: ScrollHandle::new(),
+            scroll_to_cursor: false,
             last_bounds: None,
             last_lines: Vec::new(),
             last_wrapped: Vec::new(),
@@ -496,6 +505,7 @@ impl CodeEditor {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.completion = None;
+        self.scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -509,6 +519,7 @@ impl CodeEditor {
             self.selection_reversed = !self.selection_reversed;
             self.selected_range = self.selected_range.end..self.selected_range.start;
         }
+        self.scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -1113,6 +1124,7 @@ impl EntityInputHandler for CodeEditor {
         self.selected_range = caret..caret;
         self.last_edit_caret = caret;
         self.marked_range = None;
+        self.scroll_to_cursor = true;
         self.refresh_completions();
         cx.notify();
     }
@@ -1151,6 +1163,7 @@ impl EntityInputHandler for CodeEditor {
                 let caret = range.start + new_text.len();
                 caret..caret
             });
+        self.scroll_to_cursor = true;
         cx.notify();
     }
 
@@ -1518,6 +1531,34 @@ impl Element for CodeElement {
             }
         }
 
+        // Caret-follow autoscroll: after an edit or caret move, nudge the scroll
+        // offset so the caret sits inside the viewport. Gated on `scroll_to_cursor`
+        // (set by those mutations) so a wheel-scroll away from the caret isn't undone
+        // every frame. The caret quad is already in window space (scroll-translated),
+        // so we compare it against the live viewport bounds. set_offset lands next
+        // frame, hence the refresh; the flag is cleared below so it can't loop.
+        if self.editor.read(cx).scroll_to_cursor {
+            if let Some(caret) = prepaint.cursor.as_ref() {
+                let scroll = self.editor.read(cx).scroll_handle.clone();
+                let view = scroll.bounds();
+                if view.size.height > px(0.) {
+                    let mut offset = scroll.offset();
+                    let start = offset.y;
+                    if caret.bounds.top() < view.top() {
+                        offset.y += view.top() - caret.bounds.top();
+                    } else if caret.bounds.bottom() > view.bottom() {
+                        offset.y -= caret.bounds.bottom() - view.bottom();
+                    }
+                    // Never reveal blank space above the first line.
+                    offset.y = offset.y.min(px(0.));
+                    if offset.y != start {
+                        scroll.set_offset(offset);
+                        window.refresh();
+                    }
+                }
+            }
+        }
+
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
@@ -1529,6 +1570,7 @@ impl Element for CodeElement {
             editor.last_lines = lines;
             editor.last_wrapped = wrapped;
             editor.last_line_height = line_height;
+            editor.scroll_to_cursor = false;
         });
     }
 }
@@ -1632,6 +1674,7 @@ impl Render for CodeEditor {
             .id("code-scroll")
             .flex_1()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
             .py_2()
             .child(
                 div()

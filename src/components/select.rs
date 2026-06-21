@@ -27,6 +27,7 @@ pub struct Select {
     options: Vec<SharedString>,
     selected: usize,
     open: bool,
+    accent: bool,
     placeholder: SharedString,
     chevron: Option<AnyElement>,
     check: Option<AnyElement>,
@@ -41,6 +42,7 @@ impl Select {
             options: Vec::new(),
             selected: 0,
             open: false,
+            accent: true,
             placeholder: "Select…".into(),
             chevron: None,
             check: None,
@@ -61,6 +63,14 @@ impl Select {
 
     pub fn open(mut self, open: bool) -> Self {
         self.open = open;
+        self
+    }
+
+    /// Whether the trigger and selected row read in the accent color (the default,
+    /// native popup-button look) or the neutral text color. Neutral suits dense
+    /// toolbars where an accent-colored value would over-emphasize the control.
+    pub fn accent(mut self, accent: bool) -> Self {
+        self.accent = accent;
         self
     }
 
@@ -100,6 +110,9 @@ impl RenderOnce for Select {
         let theme = cx.theme().clone();
         let open = self.open;
         let selected = self.selected;
+        let accent = self.accent;
+        // The value/selection hue: accent for the native popup look, else neutral.
+        let value_color = if accent { theme.accent } else { theme.text };
 
         // The menu is anchored to the trigger's *measured* window bounds, not to a
         // layout-flow guess — a stateless `anchored()` in relative mode lands a
@@ -139,7 +152,7 @@ impl RenderOnce for Select {
                 .flex()
                 .flex_col()
                 .items_center()
-                .text_color(theme.accent)
+                .text_color(if accent { theme.accent } else { theme.text_muted })
                 .text_size(theme.font_size_micro())
                 .line_height(px(6.))
                 .child("⌃")
@@ -156,6 +169,9 @@ impl RenderOnce for Select {
             .items_center()
             .gap_1p5()
             .h(px(24.))
+            // Allow the trigger to shrink below its content width in a tight
+            // toolbar; the label truncates rather than overflowing its row.
+            .min_w(px(0.))
             .px_2()
             .rounded(theme.radius)
             .bg(theme.bg_input)
@@ -168,15 +184,15 @@ impl RenderOnce for Select {
             .text_size(theme.font_size)
             .font_weight(FontWeight::MEDIUM)
             .text_color(if has_selection {
-                theme.accent
+                value_color
             } else {
                 theme.text_faint
             })
             .cursor_pointer()
             .tab_index(0)
             .focus(move |s| s.focus_ring_color(ring, glow))
-            .child(div().child(current))
-            .child(disclosure)
+            .child(div().min_w(px(0.)).truncate().child(current))
+            .child(div().flex_shrink_0().child(disclosure))
             .child(
                 // Invisible overlay that records the trigger's window bounds so the
                 // menu can anchor to its bottom-left. Re-renders only on a change.
@@ -235,7 +251,7 @@ impl RenderOnce for Select {
                     .rounded(px(4.))
                     .text_size(item_size)
                     .text_color(if is_selected {
-                        theme.accent
+                        value_color
                     } else {
                         theme.text
                     })
