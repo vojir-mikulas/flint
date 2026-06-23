@@ -9,6 +9,7 @@
 pub mod components;
 pub mod scrim;
 pub mod styled_ext;
+pub mod syntax;
 pub mod theme;
 
 mod tokens;
@@ -22,12 +23,14 @@ pub use gpui;
 pub use components::badge::{Badge, BadgeVariant};
 pub use components::button::{Button, ButtonSize, ButtonVariant};
 pub use components::code_editor::{
-    CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
+    CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider,
+    Highlighter, RichCompletionProvider, TokenStyle,
 };
 pub use components::combo_box::{ComboBox, ComboBoxEvent};
 pub use components::context_menu::{ContextMenu, ContextMenuItem};
 pub use components::floating::{floating, Floating};
 pub use components::icon_button::{IconButton, IconButtonSize};
+pub use components::markdown_editor::{MarkdownEditor, MarkdownEditorEvent};
 pub use components::modal::Modal;
 pub use components::number_input::{NumberInput, NumberInputEvent};
 pub use components::palette::{Palette, PaletteEvent, PaletteItem};
@@ -55,12 +58,14 @@ pub mod prelude {
     pub use crate::components::badge::{Badge, BadgeVariant};
     pub use crate::components::button::{Button, ButtonSize, ButtonVariant};
     pub use crate::components::code_editor::{
-        CodeEditor, CodeEditorEvent, CompletionProvider, Highlighter, TokenStyle,
+        CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider,
+        Highlighter, RichCompletionProvider, TokenStyle,
     };
     pub use crate::components::combo_box::{ComboBox, ComboBoxEvent};
     pub use crate::components::context_menu::{ContextMenu, ContextMenuItem};
     pub use crate::components::floating::{floating, Floating};
     pub use crate::components::icon_button::{IconButton, IconButtonSize};
+    pub use crate::components::markdown_editor::{MarkdownEditor, MarkdownEditorEvent};
     pub use crate::components::modal::Modal;
     pub use crate::components::number_input::{NumberInput, NumberInputEvent};
     pub use crate::components::palette::{Palette, PaletteEvent, PaletteItem};

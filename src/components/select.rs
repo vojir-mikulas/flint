@@ -152,7 +152,11 @@ impl RenderOnce for Select {
                 .flex()
                 .flex_col()
                 .items_center()
-                .text_color(if accent { theme.accent } else { theme.text_muted })
+                .text_color(if accent {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                })
                 .text_size(theme.font_size_micro())
                 .line_height(px(6.))
                 .child("⌃")
@@ -250,11 +254,7 @@ impl RenderOnce for Select {
                     .py_1()
                     .rounded(px(4.))
                     .text_size(item_size)
-                    .text_color(if is_selected {
-                        value_color
-                    } else {
-                        theme.text
-                    })
+                    .text_color(if is_selected { value_color } else { theme.text })
                     .cursor_pointer()
                     .tab_index(0)
                     .focus(move |s| s.bg(theme.bg_hover).focus_ring_color(ring, glow))

@@ -132,6 +132,76 @@ pub type CompletionProvider = Rc<dyn Fn(&str, usize) -> Vec<SharedString>>;
 /// whatever string the owner returns. `None` (the default) shows bare candidates.
 pub type CompletionDetail = Rc<dyn Fn(&str) -> Option<SharedString>>;
 
+/// A generic, domain-free completion category. The owner (e.g. RED) maps its own
+/// concepts onto these; the editor renders a small coloured badge per kind and
+/// never learns what a "table" is. [`CompletionKind::Text`] draws no badge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CompletionKind {
+    Keyword,
+    Function,
+    /// A member — a column, field, or property.
+    Field,
+    /// A named container — a table, struct, or namespace.
+    Object,
+    /// A type name.
+    Type,
+    /// A literal value or enum member.
+    Value,
+    /// Plain text — no badge (the default).
+    #[default]
+    Text,
+}
+
+impl CompletionKind {
+    /// A short badge glyph and its accent colour, or `None` for [`Self::Text`].
+    fn badge(self, t: &Theme) -> Option<(&'static str, Hsla)> {
+        Some(match self {
+            CompletionKind::Keyword => ("K", t.purple),
+            CompletionKind::Function => ("ƒ", t.blue),
+            CompletionKind::Field => ("▪", t.cyan),
+            CompletionKind::Object => ("▦", t.text_muted),
+            CompletionKind::Type => ("T", t.orange),
+            CompletionKind::Value => ("V", t.green),
+            CompletionKind::Text => return None,
+        })
+    }
+}
+
+/// A rich completion candidate: the inserted `label`, a [`CompletionKind`] badge,
+/// an optional dim `detail` beside it (a column type, a function signature), and
+/// optional `documentation` rendered in a side panel for the highlighted item.
+/// Build via [`CompletionItem::new`] plus the chained setters.
+#[derive(Clone)]
+pub struct CompletionItem {
+    pub label: SharedString,
+    pub kind: CompletionKind,
+    pub detail: Option<SharedString>,
+    pub documentation: Option<SharedString>,
+}
+
+impl CompletionItem {
+    pub fn new(label: impl Into<SharedString>, kind: CompletionKind) -> Self {
+        Self { label: label.into(), kind, detail: None, documentation: None }
+    }
+
+    /// A short dim label shown to the right of the candidate (type, signature…).
+    pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// A one-line guide rendered in the popup's doc panel while highlighted.
+    pub fn documentation(mut self, doc: impl Into<SharedString>) -> Self {
+        self.documentation = Some(doc.into());
+        self
+    }
+}
+
+/// A richer completion seam than [`CompletionProvider`]: returns [`CompletionItem`]s
+/// that carry a kind badge, detail, and documentation. When set it supersedes the
+/// plain string provider.
+pub type RichCompletionProvider = Rc<dyn Fn(&str, usize) -> Vec<CompletionItem>>;
+
 /// Emitted so the owner reacts to editor-level keys without the editor knowing
 /// what they mean.
 #[derive(Clone, Copy, Debug)]
@@ -151,7 +221,7 @@ pub enum CodeEditorEvent {
 /// on accept), the matching `candidates`, and which one is highlighted.
 struct Completion {
     start: usize,
-    candidates: Vec<SharedString>,
+    candidates: Vec<CompletionItem>,
     selected: usize,
 }
 
@@ -189,6 +259,9 @@ pub struct CodeEditor {
     resting_border: bool,
     highlighter: Option<Highlighter>,
     completion_provider: Option<CompletionProvider>,
+    /// A richer provider that supersedes [`completion_provider`](Self::completion_provider)
+    /// when set — its items carry a kind badge, detail, and documentation.
+    rich_provider: Option<RichCompletionProvider>,
     /// Optional dim label shown beside each candidate (see [`CompletionDetail`]).
     completion_detail: Option<CompletionDetail>,
     completion: Option<Completion>,
@@ -238,6 +311,7 @@ impl CodeEditor {
             resting_border: true,
             highlighter: None,
             completion_provider: None,
+            rich_provider: None,
             completion_detail: None,
             completion: None,
             a11y_label: SharedString::from("Code editor"),
@@ -343,12 +417,31 @@ impl CodeEditor {
     /// Attach a dim detail label to each candidate in the popup (see
     /// [`CompletionDetail`]) — e.g. a slash command's description. Optional; without
     /// it the popup shows bare candidate strings.
-    pub fn completion_detail(
-        mut self,
-        f: impl Fn(&str) -> Option<SharedString> + 'static,
-    ) -> Self {
+    pub fn completion_detail(mut self, f: impl Fn(&str) -> Option<SharedString> + 'static) -> Self {
         self.completion_detail = Some(Rc::new(f));
         self
+    }
+
+    /// Install the rich completion seam ([`RichCompletionProvider`]). Items carry a
+    /// [`CompletionKind`] badge, a dim `detail`, and `documentation` shown in the
+    /// popup's doc panel. When set it supersedes [`Self::completions`].
+    pub fn rich_completions(
+        mut self,
+        f: impl Fn(&str, usize) -> Vec<CompletionItem> + 'static,
+    ) -> Self {
+        self.rich_provider = Some(Rc::new(f));
+        self
+    }
+
+    /// Replace the rich completion provider after construction — RED rebuilds it as
+    /// the schema loads, so candidates grow without recreating the editor.
+    pub fn set_rich_completions(
+        &mut self,
+        f: impl Fn(&str, usize) -> Vec<CompletionItem> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.rich_provider = Some(Rc::new(f));
+        cx.notify();
     }
 
     pub fn content(&self) -> String {
@@ -502,6 +595,22 @@ impl CodeEditor {
         }
     }
 
+    /// Move the caret to `offset` (clamped to the content and snapped to a char
+    /// boundary), collapsing any selection and scrolling it into view. Lets a host
+    /// place the cursor after a programmatic [`set_content`](Self::set_content) —
+    /// e.g. restoring position after a line move.
+    pub fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let mut o = offset.min(self.content.len());
+        while o > 0 && !self.content.is_char_boundary(o) {
+            o -= 1;
+        }
+        self.selected_range = o..o;
+        self.selection_reversed = false;
+        self.last_edit_caret = o;
+        self.scroll_to_cursor = true;
+        cx.notify();
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.completion = None;
@@ -579,18 +688,37 @@ impl CodeEditor {
     }
 
     /// Recompute the completion popup against the provider. Called after edits.
+    /// The rich provider wins when present; otherwise the plain string provider's
+    /// candidates are wrapped (kind [`CompletionKind::Text`], with any
+    /// [`CompletionDetail`] applied) so both seams render through one path.
     fn refresh_completions(&mut self) {
         self.completion = None;
-        let Some(provider) = self.completion_provider.clone() else {
-            return;
-        };
         if !self.selected_range.is_empty() {
             return;
         }
         let Some(start) = self.current_word_start() else {
             return;
         };
-        let candidates = provider(&self.content, self.cursor_offset());
+        let offset = self.cursor_offset();
+        let candidates: Vec<CompletionItem> = if let Some(provider) = self.rich_provider.clone() {
+            provider(&self.content, offset)
+        } else if let Some(provider) = self.completion_provider.clone() {
+            let detail = self.completion_detail.clone();
+            provider(&self.content, offset)
+                .into_iter()
+                .map(|label| {
+                    let d = detail.as_ref().and_then(|f| f(&label));
+                    CompletionItem {
+                        label,
+                        kind: CompletionKind::Text,
+                        detail: d,
+                        documentation: None,
+                    }
+                })
+                .collect()
+        } else {
+            return;
+        };
         if !candidates.is_empty() {
             self.completion = Some(Completion {
                 start,
@@ -636,7 +764,7 @@ impl CodeEditor {
             return false;
         };
         let cursor = self.cursor_offset();
-        let candidate = c.candidates[c.selected].to_string();
+        let candidate = c.candidates[c.selected].label.to_string();
         self.content = self.content[..c.start].to_owned() + &candidate + &self.content[cursor..];
         let caret = c.start + candidate.len();
         self.selected_range = caret..caret;
@@ -1706,43 +1834,96 @@ impl Render for CodeEditor {
         // and snaps it inside the viewport, escaping the scroll container's clip.
         let popup = self.completion_anchor().and_then(|at| {
             let c = self.completion.as_ref()?;
-            let list = div()
-                .max_w(px(280.))
+            // Candidate list (left column). Each row: kind badge · label · dim detail.
+            let list = div().flex().flex_col().w(px(236.)).flex_none().py_1().children(
+                c.candidates.iter().take(8).enumerate().map(|(i, item)| {
+                    let badge = item.kind.badge(theme);
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .px_2()
+                        .py_0p5()
+                        .text_size(px(12.))
+                        .text_color(theme.text)
+                        .when(i == c.selected, |d| d.bg(theme.bg_selected))
+                        .when_some(badge, |d, (glyph, color)| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .size(px(15.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(color.opacity(0.18))
+                                    .text_size(px(9.))
+                                    .text_color(color)
+                                    .child(SharedString::from(glyph)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .overflow_hidden()
+                                .child(item.label.clone()),
+                        )
+                        .when_some(item.detail.clone(), |d, detail| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child(detail),
+                            )
+                        })
+                }),
+            );
+            // Doc side-panel for the highlighted item (detail header + guide line).
+            let doc = c
+                .candidates
+                .get(c.selected)
+                .filter(|s| s.detail.is_some() || s.documentation.is_some())
+                .map(|s| {
+                    div()
+                        .w(px(184.))
+                        .flex_none()
+                        .border_l_1()
+                        .border_color(theme.border)
+                        .bg(theme.bg_panel)
+                        .px(px(10.))
+                        .py(px(8.))
+                        .when_some(s.detail.clone(), |d, detail| {
+                            d.child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.accent)
+                                    .child(detail),
+                            )
+                        })
+                        .when_some(s.documentation.clone(), |d, guide| {
+                            d.child(
+                                div()
+                                    .mt(px(6.))
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_muted)
+                                    .child(guide),
+                            )
+                        })
+                });
+            let panel = div()
+                .flex()
+                .items_stretch()
                 .bg(theme.bg_elevated)
                 .border_1()
                 .border_color(theme.border)
                 .rounded(theme.radius_sm)
                 .shadow_lg()
-                .py_1()
-                .child(div().flex().flex_col().children(
-                    c.candidates.iter().take(8).enumerate().map(|(i, cand)| {
-                        let detail = self
-                            .completion_detail
-                            .as_ref()
-                            .and_then(|f| f(cand));
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap_2()
-                            .px_2()
-                            .py_0p5()
-                            .text_size(px(12.))
-                            .text_color(theme.text)
-                            .when(i == c.selected, |d| d.bg(theme.bg_selected))
-                            .child(cand.clone())
-                            .when_some(detail, |d, label| {
-                                d.child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .text_size(px(11.))
-                                        .text_color(theme.text_muted)
-                                        .child(label),
-                                )
-                            })
-                    }),
-                ));
-            Some(floating(list).at(at))
+                .overflow_hidden()
+                .child(list)
+                .when_some(doc, |d, doc| d.child(doc));
+            Some(floating(panel).at(at))
         });
 
         // A11y: a multi-line text-input node keyed off the focus handle. The

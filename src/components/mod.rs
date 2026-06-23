@@ -13,6 +13,7 @@ pub mod context_menu;
 pub mod floating;
 mod fuzzy;
 pub mod icon_button;
+pub mod markdown_editor;
 pub mod modal;
 pub mod number_input;
 pub mod palette;
