@@ -60,6 +60,7 @@ actions!(
         WordRight,
         SelectWordLeft,
         SelectWordRight,
+        SelectNextOccurrence,
         DeleteWordLeft,
         DeleteWordRight,
         DocStart,
@@ -230,6 +231,15 @@ struct Completion {
     selected: usize,
 }
 
+/// The unit a mouse drag extends by, set by the initiating click: a single click
+/// drags by character, a double-click by word, a triple-click by line.
+#[derive(Clone, Copy, PartialEq)]
+enum DragUnit {
+    Char,
+    Word,
+    Line,
+}
+
 pub struct CodeEditor {
     focus_handle: FocusHandle,
     content: String,
@@ -237,6 +247,12 @@ pub struct CodeEditor {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     is_selecting: bool,
+    /// The granularity an in-progress drag extends by, fixed by the click that
+    /// started it. Paired with [`drag_anchor`](Self::drag_anchor).
+    drag_unit: DragUnit,
+    /// The word/line range the initiating double/triple-click selected; a drag
+    /// extends the selection to the union of this and the unit under the cursor.
+    drag_anchor: Option<Range<usize>>,
     read_only: bool,
     /// Dim prompt text shown when the buffer is empty (e.g. "Ask a question…").
     /// Purely a hint — never part of [`content`](Self::content). Empty by default.
@@ -306,6 +322,8 @@ impl CodeEditor {
             selection_reversed: false,
             marked_range: None,
             is_selecting: false,
+            drag_unit: DragUnit::Char,
+            drag_anchor: None,
             read_only: false,
             placeholder: SharedString::default(),
             gutter: true,
@@ -534,6 +552,8 @@ impl CodeEditor {
             KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
             KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
             KeyBinding::new("alt-delete", DeleteWordRight, ctx),
+            // ⌘D selects the word under the caret, then the next occurrence.
+            KeyBinding::new("cmd-d", SelectNextOccurrence, ctx),
         ]);
         #[cfg(not(target_os = "macos"))]
         cx.bind_keys([
@@ -552,6 +572,8 @@ impl CodeEditor {
             KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
             KeyBinding::new("ctrl-backspace", DeleteWordLeft, ctx),
             KeyBinding::new("ctrl-delete", DeleteWordRight, ctx),
+            // Ctrl+D selects the word under the caret, then the next occurrence.
+            KeyBinding::new("ctrl-d", SelectNextOccurrence, ctx),
             // Ctrl+Home / Ctrl+End jump to the document's start / end.
             KeyBinding::new("ctrl-home", DocStart, ctx),
             KeyBinding::new("ctrl-end", DocEnd, ctx),
@@ -886,6 +908,40 @@ impl CodeEditor {
         self.desired_col = None;
         self.select_to(self.next_word_boundary(self.cursor_offset()), cx);
     }
+    /// ⌘D / Ctrl+D: with no selection, select the word under the caret; with one,
+    /// jump it to the next occurrence of that text (wrapping around the buffer).
+    fn select_next_occurrence(
+        &mut self,
+        _: &SelectNextOccurrence,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.desired_col = None;
+        if self.selected_range.is_empty() {
+            let word = self.word_at(self.cursor_offset());
+            if !word.is_empty() {
+                self.selected_range = word;
+                self.selection_reversed = false;
+                self.completion = None;
+                self.scroll_to_cursor = true;
+                cx.notify();
+            }
+            return;
+        }
+        let needle = self.content[self.selected_range.clone()].to_string();
+        let from = self.selected_range.end;
+        let found = self.content[from..]
+            .find(&needle)
+            .map(|i| from + i)
+            .or_else(|| self.content.find(&needle));
+        if let Some(start) = found {
+            self.selected_range = start..start + needle.len();
+            self.selection_reversed = false;
+            self.completion = None;
+            self.scroll_to_cursor = true;
+            cx.notify();
+        }
+    }
     fn delete_word_left(
         &mut self,
         _: &DeleteWordLeft,
@@ -1115,20 +1171,89 @@ impl CodeEditor {
         self.is_selecting = true;
         self.desired_col = None;
         let offset = self.index_for_mouse_position(event.position);
-        if event.modifiers.shift {
-            self.select_to(offset, cx);
-        } else {
-            self.move_to(offset, cx);
+        match event.click_count {
+            // Triple-click: select the line; dragging then extends line by line.
+            n if n >= 3 => {
+                let line = self.line_at(offset);
+                self.drag_unit = DragUnit::Line;
+                self.drag_anchor = Some(line.clone());
+                self.selected_range = line;
+                self.selection_reversed = false;
+                self.completion = None;
+                cx.notify();
+            }
+            // Double-click: select the word; dragging then extends word by word.
+            2 => {
+                let word = self.word_at(offset);
+                self.drag_unit = DragUnit::Word;
+                self.drag_anchor = Some(word.clone());
+                self.selected_range = word;
+                self.selection_reversed = false;
+                self.completion = None;
+                cx.notify();
+            }
+            // Single click: place the caret (Shift extends); a drag extends by char.
+            _ => {
+                self.drag_unit = DragUnit::Char;
+                self.drag_anchor = None;
+                if event.modifiers.shift {
+                    self.select_to(offset, cx);
+                } else {
+                    self.move_to(offset, cx);
+                }
+            }
         }
     }
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
     }
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            let offset = self.index_for_mouse_position(event.position);
-            self.select_to(offset, cx);
+        if !self.is_selecting {
+            return;
         }
+        let offset = self.index_for_mouse_position(event.position);
+        match (self.drag_unit, self.drag_anchor.clone()) {
+            (DragUnit::Word, Some(anchor)) => {
+                let unit = self.word_at(offset);
+                self.extend_union(anchor, unit, cx);
+            }
+            (DragUnit::Line, Some(anchor)) => {
+                let unit = self.line_at(offset);
+                self.extend_union(anchor, unit, cx);
+            }
+            _ => self.select_to(offset, cx),
+        }
+    }
+
+    /// The byte range of the word containing (or adjacent to) `offset`. Empty when
+    /// the click lands in whitespace between words.
+    fn word_at(&self, offset: usize) -> Range<usize> {
+        let off = offset.min(self.content.len());
+        for (idx, word) in self.content.unicode_word_indices() {
+            let end = idx + word.len();
+            if off >= idx && off <= end {
+                return idx..end;
+            }
+            if off < idx {
+                break;
+            }
+        }
+        off..off
+    }
+
+    /// The byte range of the line containing `offset` (excluding its newline).
+    fn line_at(&self, offset: usize) -> Range<usize> {
+        let (line, _) = self.line_col(offset);
+        self.line_ranges()[line].clone()
+    }
+
+    /// Set the selection to the union of the drag `anchor` and the `unit` under the
+    /// cursor, reversed when dragging back before the anchor.
+    fn extend_union(&mut self, anchor: Range<usize>, unit: Range<usize>, cx: &mut Context<Self>) {
+        self.selected_range = anchor.start.min(unit.start)..anchor.end.max(unit.end);
+        self.selection_reversed = unit.start < anchor.start;
+        self.scroll_to_cursor = true;
+        cx.notify();
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -2002,6 +2127,7 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::word_right))
             .on_action(cx.listener(Self::select_word_left))
             .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::select_next_occurrence))
             .on_action(cx.listener(Self::delete_word_left))
             .on_action(cx.listener(Self::delete_word_right))
             .on_action(cx.listener(Self::doc_start))
