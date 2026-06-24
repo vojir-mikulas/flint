@@ -14,9 +14,14 @@
 //! so `CodeEditor` (used by RED) is never touched. The rendering is the net-new
 //! part: instead of one shaped layout over the whole buffer at a single font size,
 //! every logical line is shaped on its own so each can carry its own size and a set
-//! of per-span styled [`TextRun`]s. Always soft-wraps; no gutter; no completion.
+//! of per-span styled [`TextRun`]s. Always soft-wraps; no gutter. A `[[`/`#`
+//! completion popup is owner-driven: the editor detects the trigger context and
+//! emits [`MarkdownEditorEvent::Completion`]; the owner pushes candidates back via
+//! [`MarkdownEditor::set_completions`].
 
 use std::ops::Range;
+use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
     actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, ClipboardItem, Context,
@@ -27,7 +32,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::components::code_editor::TokenStyle;
+use crate::components::code_editor::{CompletionItem, TokenStyle};
 use crate::components::floating::floating;
 use crate::theme::{ActiveTheme, Theme};
 
@@ -97,12 +102,39 @@ enum EditKind {
 
 /// Emitted so the owner reacts to editor-level keys without the editor knowing
 /// what they mean (e.g. ⌘↵ flushes a save in VAN).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum MarkdownEditorEvent {
     /// ⌘↵ — the owner acts on the buffer (e.g. save).
     Run,
     /// Esc with focus in the editor — the owner can move focus elsewhere.
     Escape,
+    /// The `[[`/`#` completion context changed (the popup opened or its query
+    /// grew/shrank). The owner should compute candidates for `query` and push
+    /// them back with [`MarkdownEditor::set_completions`]. The editor stays
+    /// domain-free — it never knows what a note or a tag is.
+    Completion {
+        trigger: CompletionTrigger,
+        query: String,
+    },
+    /// The pointer entered or left an inline `[[wikilink]]`. `target` is the link's
+    /// destination (the text before any `|alias` or `#heading`), or `None` when the
+    /// pointer left a link. `at` is the window-space point just below the link, where
+    /// the owner can float a preview. Emitted only when the hovered target changes.
+    LinkHover {
+        target: Option<String>,
+        at: Point<Pixels>,
+    },
+}
+
+/// Which markup the completion popup is filling in. The editor detects this from
+/// the text before the caret and reports it so the owner knows which candidate
+/// set to supply; on accept the editor wraps the choice appropriately.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompletionTrigger {
+    /// A `[[wikilink]]` — the accepted candidate is wrapped to `[[choice]]`.
+    Wikilink,
+    /// A `#tag` — the accepted candidate replaces the typed tag text.
+    Tag,
 }
 
 /// A block command offered by the `/` menu: matched against `keys`, shown as
@@ -143,9 +175,7 @@ fn parse_list_marker(line: &str) -> Option<ListMarker> {
     // Unordered bullet, optionally a todo checkbox.
     if matches!(first, '-' | '*' | '+') {
         let after = &rest[1..];
-        let Some(body) = after.strip_prefix(' ') else {
-            return None;
-        };
+        let body = after.strip_prefix(' ')?;
         let lower = body.to_ascii_lowercase();
         if lower.starts_with("[ ] ") || lower.starts_with("[x] ") {
             return Some(ListMarker {
@@ -258,6 +288,18 @@ struct Slash {
     selected: usize,
 }
 
+/// An open `[[`/`#` completion popup. `anchor` is where the marker begins (the
+/// popup drops below it); `query_start` is where the typed query begins (just
+/// after the marker), the span replaced on accept; `selected` is the highlighted
+/// row into the owner-supplied candidate list.
+#[derive(Clone)]
+struct Completion {
+    trigger: CompletionTrigger,
+    anchor: usize,
+    query_start: usize,
+    selected: usize,
+}
+
 /// The unit a mouse drag extends by, set by the initiating click: a single click
 /// drags by character, a double-click by word, a triple-click by line.
 #[derive(Clone, Copy, PartialEq)]
@@ -328,9 +370,8 @@ struct Attr {
     italic: bool,
     strike: bool,
     mono: bool,
-    /// Fenced code-block background fill (`bg_elevated`).
-    code_bg: bool,
-    /// Inline-code chip fill (a translucent accent tint).
+    /// Inline-code chip fill (a translucent accent tint). Fenced blocks get a
+    /// block-level card painted behind them instead (see `code_panels`).
     accent_bg: bool,
 }
 
@@ -342,7 +383,6 @@ impl Default for Attr {
             italic: false,
             strike: false,
             mono: false,
-            code_bg: false,
             accent_bg: false,
         }
     }
@@ -371,16 +411,16 @@ impl Attr {
         self.color = c;
         self
     }
-    /// Fenced code-block text: mono over a subtle block fill.
-    fn code(mut self) -> Self {
+    /// Fenced code-block text: mono in the default code colour. The block fill is a
+    /// card painted behind the whole fence, not a per-glyph background.
+    fn code_plain(mut self) -> Self {
         self.color = SemColor::Code;
         self.mono = true;
-        self.code_bg = true;
         self
     }
 
     /// Inline `` `code` ``: mono, accent-tinted, over an accent chip fill — louder
-    /// than the fenced fill so short spans stand out in running prose.
+    /// than the fenced card so short spans stand out in running prose.
     fn inline_code(mut self) -> Self {
         self.color = SemColor::Accent;
         self.mono = true;
@@ -406,13 +446,7 @@ impl Attr {
         if self.mono {
             font.family = theme.mono_family.clone();
         }
-        let background_color = if self.accent_bg {
-            Some(theme.accent.opacity(0.14))
-        } else if self.code_bg {
-            Some(theme.bg_elevated)
-        } else {
-            None
-        };
+        let background_color = self.accent_bg.then(|| theme.accent.opacity(0.14));
         TextRun {
             len,
             font,
@@ -453,6 +487,256 @@ struct LineDecor {
     spans: Vec<(Range<usize>, Attr)>,
     subs: Vec<(Range<usize>, Sub)>,
     divider: bool,
+    /// Part of a fenced code block (a ``` line or its body) — the renderer paints a
+    /// rounded card behind contiguous runs of these rows.
+    code_block: bool,
+}
+
+/// A line's role inside a GitHub-style markdown table, plus the table's shared
+/// per-column widths (in chars, for monospace alignment) and the block's line-index
+/// range (so the whole table reveals to raw source when the caret enters it).
+#[derive(Clone)]
+struct TableRow {
+    kind: TableKind,
+    widths: Rc<Vec<usize>>,
+    block: Range<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum TableKind {
+    Header,
+    Delimiter,
+    Body,
+}
+
+/// The byte ranges of each cell on a pipe-delimited row, tolerating the optional
+/// leading/trailing `|`: `| a | b |` and `a | b` both yield two cell ranges. The
+/// ranges include any surrounding spaces (trim when reading the content).
+fn split_pipe_cells(line: &str) -> Vec<Range<usize>> {
+    let start = line.len() - line.trim_start().len();
+    let mut s = start;
+    let mut e = line.trim_end().len();
+    if line[s..e].starts_with('|') {
+        s += 1;
+    }
+    if e > s && line[s..e].ends_with('|') {
+        e -= 1;
+    }
+    let mut cells = Vec::new();
+    let mut cur = s;
+    let bytes = line.as_bytes();
+    for (i, b) in bytes.iter().enumerate().take(e).skip(s) {
+        if *b == b'|' {
+            cells.push(cur..i);
+            cur = i + 1;
+        }
+    }
+    cells.push(cur..e);
+    cells
+}
+
+/// Whether a row is a table delimiter (`|---|:--:|`): every cell is non-empty and
+/// made only of `-`, `:`, and spaces.
+fn is_table_delimiter(line: &str) -> bool {
+    if !line.contains('|') {
+        return false;
+    }
+    let cells = split_pipe_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let t = line[c.clone()].trim();
+            !t.is_empty() && t.chars().all(|ch| matches!(ch, '-' | ':'))
+        })
+}
+
+/// Classify every logical line as part of a table block or not. A table is a row
+/// containing `|` immediately followed by a delimiter row; its body runs until a
+/// blank or non-pipe line. Fenced code is skipped so a `|` in code isn't a table.
+fn table_map(content: &str) -> Vec<Option<TableRow>> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let n = lines.len();
+    let mut out: Vec<Option<TableRow>> = vec![None; n];
+
+    // Mark lines inside fenced code blocks (and the fence lines themselves).
+    let mut in_code = vec![false; n];
+    let mut fence = false;
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("```") {
+            in_code[i] = true;
+            fence = !fence;
+        } else {
+            in_code[i] = fence;
+        }
+    }
+
+    let is_row = |i: usize| !in_code[i] && lines[i].contains('|');
+
+    let mut i = 0;
+    while i < n {
+        let starts_table = is_row(i)
+            && !is_table_delimiter(lines[i])
+            && i + 1 < n
+            && is_row(i + 1)
+            && is_table_delimiter(lines[i + 1]);
+        if !starts_table {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 2;
+        while end < n && is_row(end) && !lines[end].trim().is_empty() {
+            end += 1;
+        }
+
+        // Column widths over the header + body rows (the delimiter is excluded).
+        let mut widths: Vec<usize> = Vec::new();
+        let mut measure = |idx: usize| {
+            for (ci, cell) in split_pipe_cells(lines[idx]).into_iter().enumerate() {
+                let w = lines[idx][cell].trim().chars().count();
+                if ci >= widths.len() {
+                    widths.push(w);
+                } else {
+                    widths[ci] = widths[ci].max(w);
+                }
+            }
+        };
+        measure(start);
+        for idx in (start + 2)..end {
+            measure(idx);
+        }
+        for w in widths.iter_mut() {
+            *w = (*w).max(1);
+        }
+
+        let widths = Rc::new(widths);
+        let block = start..end;
+        out[start] = Some(TableRow {
+            kind: TableKind::Header,
+            widths: widths.clone(),
+            block: block.clone(),
+        });
+        out[start + 1] = Some(TableRow {
+            kind: TableKind::Delimiter,
+            widths: widths.clone(),
+            block: block.clone(),
+        });
+        for row in out.iter_mut().take(end).skip(start + 2) {
+            *row = Some(TableRow {
+                kind: TableKind::Body,
+                widths: widths.clone(),
+                block: block.clone(),
+            });
+        }
+        i = end;
+    }
+    out
+}
+
+/// Render one concealed table row as monospace text: each cell trimmed and padded
+/// to its column width, cells joined by ` │ `, with a one-space border each side.
+/// Monospace + padding gives column alignment and the `│` separators for free —
+/// no pixel math. The segments map padding/separators to zero-length buffer spans
+/// so a click still lands near the right offset.
+fn render_table_row(
+    line: &str,
+    widths: &[usize],
+    header: bool,
+    mono: &Font,
+    theme: &Theme,
+) -> (String, Vec<TextRun>, Vec<Segment>) {
+    let content_attr = if header {
+        Attr::default().bold()
+    } else {
+        Attr::default().colored(SemColor::Muted)
+    };
+    let sep_attr = Attr::faint();
+
+    let mut display = String::new();
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut segments: Vec<Segment> = Vec::new();
+
+    // A run of literal display text that doesn't exist in the buffer (padding,
+    // separators, borders), anchored to a buffer offset with zero length.
+    let push_filler = |display: &mut String,
+                       runs: &mut Vec<TextRun>,
+                       segments: &mut Vec<Segment>,
+                       text: &str,
+                       attr: &Attr,
+                       buf_at: usize| {
+        let ds = display.len();
+        display.push_str(text);
+        runs.push(attr.run(text.len(), mono, theme));
+        segments.push(Segment {
+            disp_start: ds,
+            disp_len: text.len(),
+            buf_start: buf_at,
+            buf_len: 0,
+        });
+    };
+
+    let cells = split_pipe_cells(line);
+    push_filler(
+        &mut display,
+        &mut runs,
+        &mut segments,
+        " ",
+        &sep_attr,
+        cells.first().map(|c| c.start).unwrap_or(0),
+    );
+
+    for (ci, cell) in cells.iter().enumerate() {
+        if ci > 0 {
+            push_filler(
+                &mut display,
+                &mut runs,
+                &mut segments,
+                " │ ",
+                &sep_attr,
+                cell.start,
+            );
+        }
+        let raw = &line[cell.clone()];
+        let content = raw.trim();
+        // Buffer offset where the trimmed content begins.
+        let content_start = cell.start + (raw.len() - raw.trim_start().len());
+        if !content.is_empty() {
+            let ds = display.len();
+            display.push_str(content);
+            runs.push(content_attr.run(content.len(), mono, theme));
+            segments.push(Segment {
+                disp_start: ds,
+                disp_len: content.len(),
+                buf_start: content_start,
+                buf_len: content.len(),
+            });
+        }
+        let pad = widths
+            .get(ci)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(content.chars().count());
+        if pad > 0 {
+            let spaces = " ".repeat(pad);
+            push_filler(
+                &mut display,
+                &mut runs,
+                &mut segments,
+                &spaces,
+                &content_attr,
+                content_start + content.len(),
+            );
+        }
+    }
+    push_filler(
+        &mut display,
+        &mut runs,
+        &mut segments,
+        " ",
+        &sep_attr,
+        line.len(),
+    );
+
+    (display, runs, segments)
 }
 
 /// Decorate every logical line of `content` (split on '\n', so the count matches
@@ -471,8 +755,9 @@ fn decorate_line(line: &str, fence: &mut Option<String>) -> LineDecor {
     let trimmed = line.trim_start();
     let indent = line.len() - trimmed.len();
 
-    // Fenced code block: the ``` lines render dim; the body is syntax-highlighted in
-    // the fence's language (captured from the opening info string).
+    // Fenced code block: the ``` lines are concealed (so the block reads as a card,
+    // its language shown as an overlay tag in `render`); the body is syntax-highlighted
+    // in the fence's language, captured from the opening info string.
     if trimmed.starts_with("```") {
         if fence.is_some() {
             *fence = None; // closing fence
@@ -480,7 +765,7 @@ fn decorate_line(line: &str, fence: &mut Option<String>) -> LineDecor {
             let info = trimmed.trim_start_matches('`').trim();
             *fence = Some(info.split_whitespace().next().unwrap_or("").to_string());
         }
-        return whole_line(line, Attr::faint().code());
+        return fenced_marker_line(line);
     }
     if let Some(lang) = fence.as_deref() {
         return fenced_code_line(line, lang);
@@ -514,6 +799,7 @@ fn decorate_line(line: &str, fence: &mut Option<String>) -> LineDecor {
             spans,
             subs,
             divider: false,
+            code_block: false,
         };
     }
 
@@ -526,6 +812,7 @@ fn decorate_line(line: &str, fence: &mut Option<String>) -> LineDecor {
             spans: vec![(0..line.len(), Attr::faint())],
             subs: Vec::new(),
             divider: true,
+            code_block: false,
         };
     }
 
@@ -542,6 +829,7 @@ fn decorate_line(line: &str, fence: &mut Option<String>) -> LineDecor {
             spans,
             subs,
             divider: false,
+            code_block: false,
         };
     }
 
@@ -576,6 +864,7 @@ fn decorate_line(line: &str, fence: &mut Option<String>) -> LineDecor {
             spans,
             subs,
             divider: false,
+            code_block: false,
         };
     }
 
@@ -589,24 +878,31 @@ fn decorate_line(line: &str, fence: &mut Option<String>) -> LineDecor {
         spans,
         subs,
         divider: false,
+        code_block: false,
     }
 }
 
-fn whole_line(line: &str, attr: Attr) -> LineDecor {
+/// A ``` fence line. Concealed to nothing (the raw backticks show only when the
+/// cursor is on the line) so it becomes top/bottom padding for the card; the
+/// language tag + copy button are drawn as overlays in `render`. Flagged
+/// `code_block` so the card spans it.
+fn fenced_marker_line(line: &str) -> LineDecor {
+    let attr = Attr::faint();
     LineDecor {
         scale: 1.0,
         base: attr,
         spans: vec![(0..line.len(), attr)],
-        subs: Vec::new(),
+        subs: vec![(0..line.len(), Sub::Hide)],
         divider: false,
+        code_block: true,
     }
 }
 
-/// A line inside a fenced code block: mono over the block fill, with token spans
-/// from the generic [`crate::syntax`] highlighter painted on top. Gaps fall back to
-/// the `base` (default code colour), so the whole line keeps its background.
+/// A line inside a fenced code block: mono in the code colour, with token spans from
+/// the generic [`crate::syntax`] highlighter painted on top. Gaps fall back to the
+/// `base`; the block's background is a card painted behind the whole fence.
 fn fenced_code_line(line: &str, lang: &str) -> LineDecor {
-    let base = Attr::default().code();
+    let base = Attr::default().code_plain();
     let lang = (!lang.is_empty()).then_some(lang);
     let spans = crate::syntax::highlight(line, lang)
         .into_iter()
@@ -618,6 +914,19 @@ fn fenced_code_line(line: &str, lang: &str) -> LineDecor {
         spans,
         subs: Vec::new(),
         divider: false,
+        code_block: true,
+    }
+}
+
+/// Left padding for fenced code rows so code breathes inside the card instead of
+/// hugging its edge. Threaded through every offset↔pixel conversion (text origin,
+/// caret, selection, hit-testing, IME, popup anchors) so those stay exact; `px(0.)`
+/// for every non-code row, which leaves prose untouched.
+fn code_pad(is_code: bool) -> Pixels {
+    if is_code {
+        px(14.)
+    } else {
+        px(0.)
     }
 }
 
@@ -826,6 +1135,18 @@ pub struct MarkdownEditor {
     a11y_label: SharedString,
     /// An open `/` block-command menu, or `None`.
     slash: Option<Slash>,
+    /// An open `[[`/`#` completion popup, or `None`.
+    completion: Option<Completion>,
+    /// Candidates last pushed by the owner via [`Self::set_completions`].
+    completion_items: Vec<CompletionItem>,
+    /// The `(trigger, query)` we last emitted a [`MarkdownEditorEvent::Completion`]
+    /// for, so caret-only moves don't re-emit and the owner isn't queried twice for
+    /// the same context.
+    completion_emitted: Option<(CompletionTrigger, String)>,
+    /// The `[[wikilink]]` target the pointer currently sits on, so a
+    /// [`MarkdownEditorEvent::LinkHover`] fires only when it changes (not on every
+    /// pixel of movement within the same link).
+    hover_link: Option<String>,
     undo_stack: Vec<EditSnapshot>,
     redo_stack: Vec<EditSnapshot>,
     last_edit: EditKind,
@@ -834,6 +1155,23 @@ pub struct MarkdownEditor {
     last_bounds: Option<Bounds<Pixels>>,
     last_rows: Vec<RowMetrics>,
     last_content_height: Pixels,
+    /// Fenced code blocks from the last paint, so `render` can place the language
+    /// label + copy button at each one's top (their pixel tops are only known
+    /// post-layout).
+    last_code_blocks: Vec<CodeBlockHit>,
+    /// Index into `last_code_blocks` whose copy button just fired, for the brief
+    /// "Copied!" flash; cleared by a spawned timer.
+    copied_block: Option<usize>,
+}
+
+/// A fenced code block located during paint: its top edge (local to the editor), its
+/// info-string language, and the raw code it holds (fence lines excluded) — for the
+/// overlay header (language tag + copy button).
+#[derive(Clone)]
+struct CodeBlockHit {
+    top: Pixels,
+    lang: String,
+    code: String,
 }
 
 /// Per logical line geometry cached from the last paint.
@@ -848,6 +1186,12 @@ struct RowMetrics {
     segments: Vec<Segment>,
     /// A concealed thematic break (`---`): paint a rule instead of text.
     divider: bool,
+    /// The row's full laid-out height (text height incl. soft-wrap, or line height).
+    height: Pixels,
+    /// Part of a fenced code block — drives the rounded card painted behind the fence.
+    code: bool,
+    /// A concealed markdown-table row — drives the bordered panel behind the table.
+    table: bool,
 }
 
 impl MarkdownEditor {
@@ -866,6 +1210,10 @@ impl MarkdownEditor {
             desired_col: None,
             a11y_label: SharedString::from("Markdown editor"),
             slash: None,
+            completion: None,
+            completion_items: Vec::new(),
+            completion_emitted: None,
+            hover_link: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit: EditKind::Other,
@@ -873,6 +1221,8 @@ impl MarkdownEditor {
             last_bounds: None,
             last_rows: Vec::new(),
             last_content_height: px(0.),
+            last_code_blocks: Vec::new(),
+            copied_block: None,
         }
     }
 
@@ -1055,7 +1405,39 @@ impl MarkdownEditor {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
         self.slash = None;
+        self.close_completion();
         cx.notify();
+    }
+
+    /// Select an explicit byte range (clamped to char boundaries), leaving the
+    /// caret at its end. Lets the owner drive selection — e.g. highlighting the
+    /// current in-note find match.
+    pub fn select_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let mut start = range.start.min(self.content.len());
+        let mut end = range.end.min(self.content.len());
+        while start > 0 && !self.content.is_char_boundary(start) {
+            start -= 1;
+        }
+        while end > 0 && !self.content.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.selected_range = start.min(end)..start.max(end);
+        self.selection_reversed = false;
+        self.last_edit_caret = self.selected_range.end;
+        self.slash = None;
+        self.close_completion();
+        cx.notify();
+    }
+
+    /// The window-space Y of the top of the line containing `offset`, from the
+    /// geometry cached at the last paint. The owner can scroll its container so this
+    /// lands in view (e.g. jumping to a heading or a find match). `None` until the
+    /// editor has painted.
+    pub fn offset_window_y(&self, offset: usize) -> Option<Pixels> {
+        let bounds = self.last_bounds?;
+        let (line, _) = self.line_col(offset);
+        let row = self.last_rows.get(line)?;
+        Some(bounds.origin.y + row.top)
     }
 
     // --- selection formatting + slash menu --------------------------------
@@ -1094,7 +1476,7 @@ impl MarkdownEditor {
             .as_ref()
             .and_then(|wl| wl.position_for_index(col, row.line_height))
             .unwrap_or(point(px(0.), px(0.)));
-        Some(bounds.origin + point(local.x, row.top + local.y - px(42.)))
+        Some(bounds.origin + point(local.x + code_pad(row.code), row.top + local.y - px(42.)))
     }
 
     /// The lowercased `/`-menu query (text after the slash up to the caret).
@@ -1115,18 +1497,31 @@ impl MarkdownEditor {
         SLASH.iter().filter(|c| slash_matches(c, &q)).collect()
     }
 
-    /// Window point just below the slash, where the menu drops.
-    fn slash_anchor(&self) -> Option<Point<Pixels>> {
-        let s = self.slash.as_ref()?;
+    /// Window point just below the character at `offset`, where a dropdown (the
+    /// `/` menu or the `[[`/`#` completion popup) should drop. Derived from the
+    /// geometry cached at the last paint, so it tracks the caret and scrolls with
+    /// the text. `None` until the editor has painted.
+    fn anchor_below(&self, offset: usize) -> Option<Point<Pixels>> {
         let bounds = self.last_bounds?;
-        let (line, col) = self.line_col(s.start);
+        let (line, col) = self.line_col(offset);
         let row = self.last_rows.get(line)?;
         let local = row
             .wrapped
             .as_ref()
             .and_then(|wl| wl.position_for_index(col, row.line_height))
             .unwrap_or(point(px(0.), px(0.)));
-        Some(bounds.origin + point(local.x, row.top + local.y + row.line_height + px(4.)))
+        Some(
+            bounds.origin
+                + point(
+                    local.x + code_pad(row.code),
+                    row.top + local.y + row.line_height + px(4.),
+                ),
+        )
+    }
+
+    /// Window point just below the slash, where the menu drops.
+    fn slash_anchor(&self) -> Option<Point<Pixels>> {
+        self.anchor_below(self.slash.as_ref()?.start)
     }
 
     fn slash_move(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1198,6 +1593,162 @@ impl MarkdownEditor {
         if SLASH.iter().any(|c| slash_matches(c, &q)) {
             self.slash = Some(Slash { start, selected: 0 });
         }
+    }
+
+    /// Push the candidates the owner computed for the live [`Completion`] context
+    /// (in response to a [`MarkdownEditorEvent::Completion`]). Resets the highlight
+    /// to the first row. A no-op flavour is just passing an empty list, which hides
+    /// the popup until the next keystroke.
+    pub fn set_completions(&mut self, items: Vec<CompletionItem>, cx: &mut Context<Self>) {
+        self.completion_items = items;
+        if let Some(c) = &mut self.completion {
+            c.selected = 0;
+        }
+        cx.notify();
+    }
+
+    /// The lowercased query for the open completion (text after the `[[`/`#`).
+    fn completion_query(&self) -> String {
+        match &self.completion {
+            Some(c) => self
+                .content
+                .get(c.query_start..self.cursor_offset())
+                .unwrap_or("")
+                .to_string(),
+            None => String::new(),
+        }
+    }
+
+    /// Window point just below the `[[`/`#` marker, where the popup drops.
+    fn completion_anchor(&self) -> Option<Point<Pixels>> {
+        self.anchor_below(self.completion.as_ref()?.anchor)
+    }
+
+    /// Whether the completion popup is actually visible — open with candidates and
+    /// no active selection. Gates the keys the popup consumes so caret navigation
+    /// still works when a query has no matches.
+    fn completion_open(&self) -> bool {
+        self.completion.is_some()
+            && !self.completion_items.is_empty()
+            && self.selected_range.is_empty()
+    }
+
+    fn completion_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = self.completion_items.len();
+        if len == 0 {
+            return;
+        }
+        if let Some(c) = &mut self.completion {
+            c.selected = (c.selected as isize + delta).rem_euclid(len as isize) as usize;
+            cx.notify();
+        }
+    }
+
+    /// Replace the typed query with the highlighted candidate. For a `[[` link the
+    /// choice is wrapped to `[[choice]]` (reusing an existing trailing `]]` if the
+    /// caret already sits before one); for a `#` tag the bare tag text is inserted.
+    fn accept_completion(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.read_only || !self.selected_range.is_empty() {
+            return false;
+        }
+        let Some(c) = self.completion.clone() else {
+            return false;
+        };
+        if self.completion_items.is_empty() {
+            return false;
+        }
+        let item = self.completion_items[c.selected.min(self.completion_items.len() - 1)].clone();
+        let label = item.label.to_string();
+        let cursor = self.cursor_offset();
+        let (insert, caret) = match c.trigger {
+            CompletionTrigger::Wikilink => {
+                if self.content[cursor..].starts_with("]]") {
+                    (label.clone(), c.query_start + label.len() + 2)
+                } else {
+                    (format!("{label}]]"), c.query_start + label.len() + 2)
+                }
+            }
+            CompletionTrigger::Tag => (label.clone(), c.query_start + label.len()),
+        };
+        self.record_undo(EditKind::Other);
+        self.content = format!(
+            "{}{}{}",
+            &self.content[..c.query_start],
+            insert,
+            &self.content[cursor..]
+        );
+        self.selected_range = caret..caret;
+        self.last_edit_caret = caret;
+        self.close_completion();
+        cx.notify();
+        true
+    }
+
+    /// Clear all completion state (popup, candidates, the emit guard).
+    fn close_completion(&mut self) {
+        self.completion = None;
+        self.completion_items.clear();
+        self.completion_emitted = None;
+    }
+
+    /// Recompute the `[[`/`#` completion context from the text before the caret.
+    /// When a fresh trigger/query is found, emit [`MarkdownEditorEvent::Completion`]
+    /// so the owner can supply candidates. Never fires while the `/` menu is open.
+    fn refresh_completion(&mut self, cx: &mut Context<Self>) {
+        self.completion = None;
+        if self.slash.is_some() || !self.selected_range.is_empty() {
+            self.close_completion();
+            return;
+        }
+        let Some((trigger, anchor, query_start)) = self.completion_context() else {
+            self.close_completion();
+            return;
+        };
+        self.completion = Some(Completion {
+            trigger,
+            anchor,
+            query_start,
+            selected: 0,
+        });
+        let query = self.completion_query();
+        if self.completion_emitted.as_ref() != Some(&(trigger, query.clone())) {
+            self.completion_emitted = Some((trigger, query.clone()));
+            cx.emit(MarkdownEditorEvent::Completion { trigger, query });
+        }
+    }
+
+    /// Detect a completion trigger ending at the caret: an unclosed `[[` (wikilink)
+    /// or a `#tag` token. Returns `(trigger, anchor, query_start)` where `anchor` is
+    /// the marker's first byte and `query_start` is the first byte after it.
+    fn completion_context(&self) -> Option<(CompletionTrigger, usize, usize)> {
+        let cursor = self.cursor_offset();
+        let bytes = self.content.as_bytes();
+
+        // Wikilink: scan back over the query (anything but a bracket or newline);
+        // a `[[` immediately before it opens the link.
+        let mut qs = cursor;
+        while qs > 0 && !matches!(bytes[qs - 1], b'[' | b']' | b'\n') {
+            qs -= 1;
+        }
+        if qs >= 2 && bytes[qs - 1] == b'[' && bytes[qs - 2] == b'[' {
+            return Some((CompletionTrigger::Wikilink, qs - 2, qs));
+        }
+
+        // Tag: scan back over tag-body characters; a `#` that begins a token (line
+        // start or after whitespace) with at least one char typed opens the tag.
+        // The leading-char requirement keeps it off an empty `# ` heading.
+        let is_tag = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/');
+        let mut ts = cursor;
+        while ts > 0 && is_tag(bytes[ts - 1]) {
+            ts -= 1;
+        }
+        if ts < cursor && ts > 0 && bytes[ts - 1] == b'#' {
+            let before_ok = ts == 1 || matches!(bytes[ts - 2], b'\n' | b' ' | b'\t');
+            if before_ok {
+                return Some((CompletionTrigger::Tag, ts - 1, ts));
+            }
+        }
+        None
     }
 
     /// One button on the selection format toolbar. Acts on mouse-down (and stops
@@ -1298,6 +1849,10 @@ impl MarkdownEditor {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_open() {
+            self.completion_move(-1, cx);
+            return;
+        }
         if self.slash.is_some() {
             self.slash_move(-1, cx);
             return;
@@ -1305,6 +1860,10 @@ impl MarkdownEditor {
         self.vertical(true, false, cx);
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.completion_open() {
+            self.completion_move(1, cx);
+            return;
+        }
         if self.slash.is_some() {
             self.slash_move(1, cx);
             return;
@@ -1451,6 +2010,9 @@ impl MarkdownEditor {
         self.replace_text_in_range(None, "", window, cx);
     }
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.accept_completion(cx) {
+            return;
+        }
         if self.accept_slash(cx) {
             return;
         }
@@ -1508,6 +2070,9 @@ impl MarkdownEditor {
         self.replace_text_in_range(None, "\n", window, cx);
     }
     fn insert_tab(&mut self, _: &InsertTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.accept_completion(cx) {
+            return;
+        }
         if self.accept_slash(cx) {
             return;
         }
@@ -1527,9 +2092,12 @@ impl MarkdownEditor {
         cx.emit(MarkdownEditorEvent::Run);
     }
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        // Esc dismisses an open `/` menu, then collapses a selection (deselect), and
-        // only with neither is it the owner's to act on.
-        if self.slash.take().is_some() {
+        // Esc dismisses an open completion popup or `/` menu, then collapses a
+        // selection (deselect), and only with none of those is it the owner's to act on.
+        if self.completion_open() {
+            self.close_completion();
+            cx.notify();
+        } else if self.slash.take().is_some() {
             cx.notify();
         } else if !self.selected_range.is_empty() {
             let caret = self.cursor_offset();
@@ -1644,15 +2212,15 @@ impl MarkdownEditor {
 
         let mut lines: Vec<String> = self.content.split('\n').map(str::to_string).collect();
         let mut caret_removed = 0usize;
-        for li in s_line..=e_line {
+        for (li, line) in lines.iter_mut().enumerate().take(e_line + 1).skip(s_line) {
             if outdent {
-                let rem = lines[li].bytes().take_while(|b| *b == b' ').take(2).count();
-                lines[li].replace_range(0..rem, "");
+                let rem = line.bytes().take_while(|b| *b == b' ').take(2).count();
+                line.replace_range(0..rem, "");
                 if li == caret_line {
                     caret_removed = rem;
                 }
             } else {
-                lines[li].insert_str(0, "  ");
+                line.insert_str(0, "  ");
             }
         }
         self.content = lines.join("\n");
@@ -1680,6 +2248,26 @@ impl MarkdownEditor {
                 self.content[self.selected_range.clone()].to_string(),
             ));
         }
+    }
+
+    /// Copy a fenced block's code to the clipboard and flash "Copied!" on its button
+    /// for a moment (a spawned timer clears the flag).
+    fn copy_code_block(&mut self, idx: usize, code: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(code));
+        self.copied_block = Some(idx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1300))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_block == Some(idx) {
+                    this.copied_block = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
@@ -1823,7 +2411,15 @@ impl MarkdownEditor {
     }
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting {
+            self.update_hover_link(event.position, cx);
             return;
+        }
+        // A drag is underway: suppress any link-hover preview.
+        if self.hover_link.take().is_some() {
+            cx.emit(MarkdownEditorEvent::LinkHover {
+                target: None,
+                at: event.position,
+            });
         }
         let offset = self.index_for_mouse_position(event.position);
         match (self.drag_unit, self.drag_anchor.clone()) {
@@ -1885,6 +2481,66 @@ impl MarkdownEditor {
         }
     }
 
+    /// Recompute which inline `[[wikilink]]` the pointer sits on and, when it
+    /// differs from the last, emit a [`MarkdownEditorEvent::LinkHover`] so the owner
+    /// can show or hide a preview. The anchor point drops just below the hovered
+    /// line at the pointer's x.
+    fn update_hover_link(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let offset = self.index_for_mouse_position(position);
+        let target = self.enclosing_wikilink(offset);
+        if target == self.hover_link {
+            return;
+        }
+        self.hover_link = target.clone();
+        let (line, _) = self.line_col(offset);
+        let drop = self
+            .last_rows
+            .get(line)
+            .map(|r| r.line_height)
+            .unwrap_or(px(20.));
+        let at = match self.offset_window_y(offset) {
+            Some(y) => point(position.x, y + drop + px(4.)),
+            None => position,
+        };
+        cx.emit(MarkdownEditorEvent::LinkHover { target, at });
+    }
+
+    /// The `[[wikilink]]` target enclosing `offset`, if any — the destination text
+    /// with any `|alias` or `#heading` stripped. Scans only the offset's line.
+    fn enclosing_wikilink(&self, offset: usize) -> Option<String> {
+        let (line, _) = self.line_col(offset);
+        let range = self.line_ranges().get(line)?.clone();
+        let text = self.content.get(range.clone())?;
+        let rel = offset.saturating_sub(range.start);
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'[' && bytes[i + 1] == b'[' {
+                if let Some(close) = text[i + 2..].find("]]") {
+                    let inner = &text[i + 2..i + 2 + close];
+                    let span_end = i + 2 + close + 2;
+                    if rel >= i && rel <= span_end {
+                        let target = inner
+                            .split('|')
+                            .next()
+                            .unwrap_or(inner)
+                            .split('#')
+                            .next()
+                            .unwrap_or(inner)
+                            .trim();
+                        if !target.is_empty() {
+                            return Some(target.to_string());
+                        }
+                    }
+                    i = span_end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
         let Some(bounds) = self.last_bounds.as_ref() else {
             return 0;
@@ -1903,7 +2559,7 @@ impl MarkdownEditor {
                 let Some(wl) = row.wrapped.as_ref() else {
                     return row.range.start;
                 };
-                let local = point(position.x - bounds.left(), y - row.top);
+                let local = point(position.x - bounds.left() - code_pad(row.code), y - row.top);
                 let disp = wl
                     .closest_index_for_position(local, row.line_height)
                     .unwrap_or_else(|e| e);
@@ -2019,6 +2675,7 @@ impl EntityInputHandler for MarkdownEditor {
         self.last_edit_caret = caret;
         self.marked_range = None;
         self.refresh_slash();
+        self.refresh_completion(cx);
         cx.notify();
     }
 
@@ -2069,7 +2726,7 @@ impl EntityInputHandler for MarkdownEditor {
         let row = self.last_rows.get(line)?;
         let wl = row.wrapped.as_ref()?;
         let local = wl.position_for_index(col, row.line_height)?;
-        let x = bounds.left() + local.x;
+        let x = bounds.left() + code_pad(row.code) + local.x;
         let y = bounds.top() + row.top + local.y;
         Some(Bounds::from_corners(
             point(x, y),
@@ -2098,6 +2755,9 @@ struct PrepaintState {
     content_height: Pixels,
     cursor: Option<gpui::PaintQuad>,
     selections: Vec<gpui::PaintQuad>,
+    code_panels: Vec<gpui::PaintQuad>,
+    table_panels: Vec<gpui::PaintQuad>,
+    code_blocks: Vec<CodeBlockHit>,
     rule_color: Hsla,
 }
 
@@ -2167,6 +2827,14 @@ impl Element for MarkdownElement {
         let wrap_width = bounds.size.width;
 
         let decors = decorate_all(&content);
+        let tmap = table_map(&content);
+        // The same base font, switched to the monospace family — for table cells, so
+        // padding aligns columns.
+        let mono_font = {
+            let mut f = base_font.clone();
+            f.family = theme.mono_family.clone();
+            f
+        };
 
         // Shape each logical line on its own, at its own scaled size. A line is
         // "revealed" (raw markdown, markers dimmed) when the selection touches it —
@@ -2178,15 +2846,42 @@ impl Element for MarkdownElement {
             let line_height = base_line_height * decor.scale;
             let font_size = base_font_size * decor.scale;
             let line_text = &content[r.start..r.end];
-            let reveal = selected.start <= r.end && r.start <= selected.end;
+            // A table reveals as a whole block (so editing shows raw pipes); every
+            // other line reveals only when the selection touches it.
+            let reveal = match tmap[i].as_ref() {
+                Some(t) => {
+                    let bstart = ranges[t.block.start].start;
+                    let bend = ranges[t.block.end - 1].end;
+                    selected.start <= bend && bstart <= selected.end
+                }
+                None => selected.start <= r.end && r.start <= selected.end,
+            };
+            let table = tmap[i].as_ref().filter(|_| !reveal);
             // A concealed `---` paints as a rule (empty text); the active line shows
             // its raw dashes like any other source.
             let is_divider = decor.divider && !reveal;
+            // A collapsed (near-zero-height) row: the table delimiter, which the
+            // bordered panel renders implicitly.
+            let mut collapse = false;
             let (display, runs, segments) = if is_divider {
                 (String::new(), Vec::new(), Vec::new())
+            } else if let Some(t) = table {
+                match t.kind {
+                    TableKind::Delimiter => {
+                        collapse = true;
+                        (String::new(), Vec::new(), Vec::new())
+                    }
+                    TableKind::Header => {
+                        render_table_row(line_text, &t.widths, true, &mono_font, &theme)
+                    }
+                    TableKind::Body => {
+                        render_table_row(line_text, &t.widths, false, &mono_font, &theme)
+                    }
+                }
             } else {
                 render_line(line_text, decor, reveal, &base_font, &theme)
             };
+            let is_table_row = table.is_some();
 
             // Give headings breathing room above (like a real document), scaled to
             // the heading level. The gap is empty space owned by the previous row,
@@ -2195,25 +2890,27 @@ impl Element for MarkdownElement {
                 acc += base_line_height * ((decor.scale - 1.0) * 0.9 + 0.15);
             }
 
+            // Code rows are inset on both sides, so they wrap at a narrower width.
+            // Table rows never wrap — wrapping would break column alignment.
+            let ww = wrap_width - code_pad(decor.code_block) * 2.;
+            let wrap = if is_table_row { None } else { Some(ww) };
             let wrapped = if display.is_empty() {
                 None
             } else {
                 window
                     .text_system()
-                    .shape_text(
-                        SharedString::from(display),
-                        font_size,
-                        &runs,
-                        Some(wrap_width),
-                        None,
-                    )
+                    .shape_text(SharedString::from(display), font_size, &runs, wrap, None)
                     .ok()
                     .and_then(|mut v| (!v.is_empty()).then(|| v.remove(0)))
             };
-            let height = wrapped
-                .as_ref()
-                .map(|wl| wl.size(line_height).height)
-                .unwrap_or(line_height);
+            let height = if collapse {
+                px(7.)
+            } else {
+                wrapped
+                    .as_ref()
+                    .map(|wl| wl.size(line_height).height)
+                    .unwrap_or(line_height)
+            };
             rows.push(RowMetrics {
                 wrapped,
                 range: r.clone(),
@@ -2221,10 +2918,100 @@ impl Element for MarkdownElement {
                 line_height,
                 segments,
                 divider: is_divider,
+                height,
+                code: decor.code_block,
+                table: is_table_row,
             });
             acc += height;
         }
         let content_height = acc;
+
+        // A rounded card behind each contiguous run of code-block rows (the fence
+        // lines plus their body), so fenced blocks read as a panel rather than raw
+        // ``` text. Painted before text + selection so both sit on top.
+        let mut code_panels = Vec::new();
+        let mut code_blocks = Vec::new();
+        let mut ci = 0;
+        while ci < rows.len() {
+            if !rows[ci].code {
+                ci += 1;
+                continue;
+            }
+            let start = ci;
+            while ci < rows.len() && rows[ci].code {
+                ci += 1;
+            }
+            let top = bounds.top() + rows[start].top;
+            let last = &rows[ci - 1];
+            let bottom = bounds.top() + last.top + last.height;
+            code_panels.push(gpui::quad(
+                Bounds::from_corners(
+                    point(bounds.left(), top),
+                    point(bounds.left() + wrap_width, bottom),
+                ),
+                px(10.),
+                theme.bg_panel,
+                px(1.),
+                theme.border,
+                gpui::BorderStyle::Solid,
+            ));
+            // The block's code, fence lines excluded — for the copy button.
+            let mut code = String::new();
+            for idx in start..ci {
+                let lt = &content[ranges[idx].start..ranges[idx].end];
+                if lt.trim_start().starts_with("```") {
+                    continue;
+                }
+                if !code.is_empty() {
+                    code.push('\n');
+                }
+                code.push_str(lt);
+            }
+            // The info string on the opening fence is the language tag.
+            let opener = &content[ranges[start].start..ranges[start].end];
+            let lang = opener
+                .trim_start()
+                .trim_start_matches('`')
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            code_blocks.push(CodeBlockHit {
+                top: rows[start].top,
+                lang,
+                code,
+            });
+        }
+
+        // A bordered panel behind each contiguous run of concealed table rows, so
+        // the block reads as a table rather than monospace lines. Mirrors the code
+        // card; the header/body cells (and the delimiter's implied rule) sit on top.
+        let mut table_panels = Vec::new();
+        let mut tj = 0;
+        while tj < rows.len() {
+            if !rows[tj].table {
+                tj += 1;
+                continue;
+            }
+            let start = tj;
+            while tj < rows.len() && rows[tj].table {
+                tj += 1;
+            }
+            let top = bounds.top() + rows[start].top;
+            let last = &rows[tj - 1];
+            let bottom = bounds.top() + last.top + last.height;
+            table_panels.push(gpui::quad(
+                Bounds::from_corners(
+                    point(bounds.left(), top),
+                    point(bounds.left() + wrap_width, bottom),
+                ),
+                px(8.),
+                theme.bg_panel,
+                px(1.),
+                theme.border,
+                gpui::BorderStyle::Solid,
+            ));
+        }
 
         // Caret.
         let (cline, ccol) = editor_line_col(&ranges, cursor);
@@ -2240,7 +3027,10 @@ impl Element for MarkdownElement {
             };
             fill(
                 Bounds::new(
-                    point(bounds.left() + x, bounds.top() + row.top + y),
+                    point(
+                        bounds.left() + code_pad(row.code) + x,
+                        bounds.top() + row.top + y,
+                    ),
                     size(px(2.), row.line_height),
                 ),
                 cursor_color,
@@ -2252,17 +3042,20 @@ impl Element for MarkdownElement {
         if !selected.is_empty() {
             let (s_line, s_col) = editor_line_col(&ranges, selected.start);
             let (e_line, e_col) = editor_line_col(&ranges, selected.end);
-            let right = bounds.left() + wrap_width;
             for line in s_line..=e_line {
                 let Some(row) = rows.get(line) else { continue };
                 let line_top = bounds.top() + row.top;
                 let lh = row.line_height;
+                // Code rows are inset on both sides; mirror that for the highlight.
+                let pad = code_pad(row.code);
+                let left = bounds.left() + pad;
+                let right = bounds.left() + wrap_width - pad;
                 let Some(wl) = row.wrapped.as_ref() else {
                     // Empty line: a thin sliver so the selection reads continuous.
                     selections.push(fill(
                         Bounds::from_corners(
-                            point(bounds.left(), line_top),
-                            point(bounds.left() + px(6.), line_top + lh),
+                            point(left, line_top),
+                            point(left + px(6.), line_top + lh),
                         ),
                         selection_color,
                     ));
@@ -2287,15 +3080,15 @@ impl Element for MarkdownElement {
                     ));
                 };
                 if p0.y == p1.y {
-                    quad(bounds.left() + p0.x, bounds.left() + p1.x, p0.y);
+                    quad(left + p0.x, left + p1.x, p0.y);
                 } else {
-                    quad(bounds.left() + p0.x, right, p0.y);
+                    quad(left + p0.x, right, p0.y);
                     let mut y = p0.y + lh;
                     while y < p1.y {
-                        quad(bounds.left(), right, y);
+                        quad(left, right, y);
                         y += lh;
                     }
-                    quad(bounds.left(), bounds.left() + p1.x, p1.y);
+                    quad(left, left + p1.x, p1.y);
                 }
             }
         }
@@ -2305,6 +3098,9 @@ impl Element for MarkdownElement {
             content_height,
             cursor: caret,
             selections,
+            code_panels,
+            table_panels,
+            code_blocks,
             rule_color: theme.border_strong,
         }
     }
@@ -2326,6 +3122,14 @@ impl Element for MarkdownElement {
             cx,
         );
 
+        for panel in prepaint.code_panels.drain(..) {
+            window.paint_quad(panel);
+        }
+
+        for panel in prepaint.table_panels.drain(..) {
+            window.paint_quad(panel);
+        }
+
         for selection in prepaint.selections.drain(..) {
             window.paint_quad(selection);
         }
@@ -2344,7 +3148,7 @@ impl Element for MarkdownElement {
                     rule_color,
                 ));
             } else if let Some(wl) = row.wrapped.as_ref() {
-                let origin = point(bounds.left(), bounds.top() + row.top);
+                let origin = point(bounds.left() + code_pad(row.code), bounds.top() + row.top);
                 let _ = wl.paint(
                     origin,
                     row.line_height,
@@ -2363,10 +3167,12 @@ impl Element for MarkdownElement {
         }
 
         let content_height = prepaint.content_height;
+        let code_blocks = std::mem::take(&mut prepaint.code_blocks);
         self.editor.update(cx, |editor, _| {
             editor.last_bounds = Some(bounds);
             editor.last_rows = rows;
             editor.last_content_height = content_height;
+            editor.last_code_blocks = code_blocks;
         });
     }
 }
@@ -2624,6 +3430,140 @@ impl Render for MarkdownEditor {
             floating(list).at(at)
         });
 
+        // `[[`/`#` completion popup — drops below the marker, owner-fed candidates.
+        let completion_popup = (self.completion.is_some()
+            && self.selected_range.is_empty()
+            && !self.completion_items.is_empty())
+        .then(|| self.completion_anchor())
+        .flatten()
+        .map(|at| {
+            let selected = self
+                .completion
+                .as_ref()
+                .map(|c| c.selected)
+                .unwrap_or(0)
+                .min(self.completion_items.len().saturating_sub(1));
+            let rows = self
+                .completion_items
+                .iter()
+                .take(12)
+                .enumerate()
+                .map(|(i, item)| {
+                    let label = item.label.clone();
+                    let detail = item.detail.clone();
+                    div()
+                        .id(SharedString::from(format!("md-completion-{i}")))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(10.))
+                        .py(px(5.))
+                        .text_size(px(12.5))
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .when(i == selected, |d| d.bg(theme.bg_selected))
+                        .hover(|s| s.bg(theme.bg_hover))
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(label),
+                        )
+                        .when_some(detail, |d, detail| {
+                            d.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.))
+                                    .text_color(theme.text_faint)
+                                    .child(detail),
+                            )
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(c) = &mut this.completion {
+                                    c.selected = i;
+                                }
+                                this.accept_completion(cx);
+                            }),
+                        )
+                })
+                .collect::<Vec<_>>();
+            let list = div()
+                .id("md-completion")
+                .occlude()
+                .min_w(px(240.))
+                .max_w(px(360.))
+                .bg(theme.bg_elevated)
+                .border_1()
+                .border_color(theme.border)
+                .rounded(theme.radius_sm)
+                .shadow_lg()
+                .py(px(4.))
+                .child(div().flex().flex_col().children(rows));
+            floating(list).at(at)
+        });
+
+        // Each fenced block gets an overlay header pinned to its top edge — a subtle
+        // language tag (left) and a copy button (right). Their pixel tops come from
+        // the previous paint (`last_code_blocks`), like the selection toolbar's anchor.
+        // The header sits in the concealed opening-fence row, above the code.
+        let pad = code_pad(true);
+        let code_headers = self
+            .last_code_blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(i, blk)| {
+                let lang = (!blk.lang.is_empty()).then(|| {
+                    div()
+                        .absolute()
+                        .top(blk.top + px(7.))
+                        .left(pad)
+                        .text_size(px(9.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(blk.lang.to_uppercase()))
+                        .into_any_element()
+                });
+
+                let copied = self.copied_block == Some(i);
+                let code = blk.code.clone();
+                let button = div()
+                    .id(SharedString::from(format!("md-copy-{i}")))
+                    .occlude()
+                    .absolute()
+                    .top(blk.top + px(5.))
+                    .right(px(8.))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(theme.radius_sm)
+                    .text_size(px(10.5))
+                    .text_color(if copied {
+                        theme.green
+                    } else {
+                        theme.text_faint
+                    })
+                    .cursor_pointer()
+                    .when(!copied, |d| {
+                        d.hover(|s| s.bg(theme.bg_hover).text_color(theme.text_muted))
+                    })
+                    .child(if copied { "Copied!" } else { "Copy" })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.copy_code_block(i, code.clone(), cx);
+                        }),
+                    )
+                    .into_any_element();
+
+                lang.into_iter().chain(std::iter::once(button))
+            })
+            .collect::<Vec<_>>();
+
         let a11y_id = ElementId::from(&self.focus_handle);
         let a11y_label = self.a11y_label.clone();
         div()
@@ -2686,8 +3626,10 @@ impl Render for MarkdownEditor {
             .child(MarkdownElement {
                 editor: cx.entity(),
             })
+            .children(code_headers)
             .children(toolbar)
             .children(slash_popup)
+            .children(completion_popup)
     }
 }
 
@@ -2749,5 +3691,46 @@ mod tests {
         assert_eq!(&"- [ ] x"[..m.len], "- [ ] ");
         let m = parse_list_marker("12. y").unwrap();
         assert_eq!(&"12. y"[..m.len], "12. ");
+    }
+
+    #[test]
+    fn split_pipe_cells_tolerates_edge_pipes() {
+        let line = "| a | bb |";
+        let cells = split_pipe_cells(line);
+        let texts: Vec<&str> = cells.iter().map(|c| line[c.clone()].trim()).collect();
+        assert_eq!(texts, vec!["a", "bb"]);
+
+        let line2 = "a | bb | ccc";
+        let cells2 = split_pipe_cells(line2);
+        let texts2: Vec<&str> = cells2.iter().map(|c| line2[c.clone()].trim()).collect();
+        assert_eq!(texts2, vec!["a", "bb", "ccc"]);
+    }
+
+    #[test]
+    fn delimiter_row_detection() {
+        assert!(is_table_delimiter("|---|:--:|"));
+        assert!(is_table_delimiter(" --- | --- "));
+        assert!(!is_table_delimiter("| a | b |"));
+        assert!(!is_table_delimiter("no pipes here"));
+    }
+
+    #[test]
+    fn table_map_marks_block_and_skips_code() {
+        let content = "intro\n| h1 | h2 |\n|----|----|\n| a | b |\n| cc | d |\nafter";
+        let map = table_map(content);
+        assert!(map[0].is_none()); // intro
+        assert_eq!(map[1].as_ref().unwrap().kind, TableKind::Header);
+        assert_eq!(map[2].as_ref().unwrap().kind, TableKind::Delimiter);
+        assert_eq!(map[3].as_ref().unwrap().kind, TableKind::Body);
+        assert_eq!(map[4].as_ref().unwrap().kind, TableKind::Body);
+        assert!(map[5].is_none()); // after
+                                   // Column widths span header + body: col0 = max("h1","a","cc")=2, col1=2.
+        assert_eq!(*map[1].as_ref().unwrap().widths, vec![2, 2]);
+        // The whole table shares one block range.
+        assert_eq!(map[1].as_ref().unwrap().block, 1..5);
+
+        // A pipe inside a fenced code block is not a table.
+        let fenced = "```\n| not | a | table |\n|---|---|---|\n```";
+        assert!(table_map(fenced).iter().all(|r| r.is_none()));
     }
 }

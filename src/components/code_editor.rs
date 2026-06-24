@@ -181,7 +181,12 @@ pub struct CompletionItem {
 
 impl CompletionItem {
     pub fn new(label: impl Into<SharedString>, kind: CompletionKind) -> Self {
-        Self { label: label.into(), kind, detail: None, documentation: None }
+        Self {
+            label: label.into(),
+            kind,
+            detail: None,
+            documentation: None,
+        }
     }
 
     /// A short dim label shown to the right of the candidate (type, signature…).
@@ -607,6 +612,26 @@ impl CodeEditor {
         self.selected_range = o..o;
         self.selection_reversed = false;
         self.last_edit_caret = o;
+        self.scroll_to_cursor = true;
+        cx.notify();
+    }
+
+    /// Select the byte span `start..end` (each clamped to the content and snapped
+    /// to a char boundary) and scroll it into view, leaving the caret at `end`.
+    /// Lets a host highlight a programmatically-found span — e.g. the current
+    /// match of a find-in-editor search — without the host tracking layout.
+    pub fn select_range(&mut self, start: usize, end: usize, cx: &mut Context<Self>) {
+        let snap = |mut o: usize| {
+            o = o.min(self.content.len());
+            while o > 0 && !self.content.is_char_boundary(o) {
+                o -= 1;
+            }
+            o
+        };
+        let (s, e) = (snap(start), snap(end));
+        self.selected_range = s.min(e)..s.max(e);
+        self.selection_reversed = false;
+        self.last_edit_caret = self.selected_range.end;
         self.scroll_to_cursor = true;
         cx.notify();
     }
@@ -1835,8 +1860,13 @@ impl Render for CodeEditor {
         let popup = self.completion_anchor().and_then(|at| {
             let c = self.completion.as_ref()?;
             // Candidate list (left column). Each row: kind badge · label · dim detail.
-            let list = div().flex().flex_col().w(px(236.)).flex_none().py_1().children(
-                c.candidates.iter().take(8).enumerate().map(|(i, item)| {
+            let list = div()
+                .flex()
+                .flex_col()
+                .w(px(236.))
+                .flex_none()
+                .py_1()
+                .children(c.candidates.iter().take(8).enumerate().map(|(i, item)| {
                     let badge = item.kind.badge(theme);
                     div()
                         .flex()
@@ -1878,8 +1908,7 @@ impl Render for CodeEditor {
                                     .child(detail),
                             )
                         })
-                }),
-            );
+                }));
             // Doc side-panel for the highlighted item (detail header + guide line).
             let doc = c
                 .candidates
