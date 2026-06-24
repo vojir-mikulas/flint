@@ -114,6 +114,11 @@ struct Gallery {
 
     // --- ComboBox demo: a searchable single-select dropdown ---
     combo: Entity<ComboBox>,
+
+    // --- SelectableLabel demo: read-only highlight-and-copy text ---
+    selectable: Entity<SelectableLabel>,
+    /// Toggles the expand/collapse state of the toast-with-body demo.
+    toast_expanded: bool,
 }
 
 impl Gallery {
@@ -337,6 +342,15 @@ impl Gallery {
                 .map(|s| s.to_string())
                 .collect(),
             tree_selected: None,
+
+            selectable: cx.new(|cx| {
+                SelectableLabel::new(
+                    "Select any part of this text with the mouse and copy it with \
+                     ⌘/Ctrl+C. It wraps across lines and the highlight follows.",
+                    cx,
+                )
+            }),
+            toast_expanded: false,
         }
     }
 
@@ -714,26 +728,85 @@ impl Gallery {
             )
     }
 
-    fn toasts(&self) -> impl IntoElement {
+    fn toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        // A long body to exercise expand/collapse + the "Show more" toggle.
+        let long = "SQLITE_ERROR: near \"SELCT\": syntax error. The statement could not \
+                    be parsed — check the highlighted token and try again. This message \
+                    is intentionally long so the toast clamps it and offers a toggle.";
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(Toast::new("Connected to Production").variant(ToastVariant::Success))
-            .child(Toast::new("Uploading 3 files…").variant(ToastVariant::Info))
-            .child(Toast::new("Disk almost full").variant(ToastVariant::Warning))
-            .child(Toast::new("Permission denied").variant(ToastVariant::Error))
+            .items_start()
             .child(
-                Toast::new("Dismiss me")
+                Toast::new("Connected to Production")
+                    .variant(ToastVariant::Success)
+                    .icon("✓")
+                    .width(px(280.)),
+            )
+            .child(
+                Toast::new("Query executed")
                     .variant(ToastVariant::Info)
+                    .icon("✦")
+                    .detail("128 rows · 14 ms")
+                    .width(px(280.)),
+            )
+            .child(
+                Toast::new("Disk almost full")
+                    .variant(ToastVariant::Warning)
+                    .icon("⚠")
+                    .width(px(280.))
                     .on_close(|_, _| {}),
             )
             .child(
-                Toast::new("Exporting… 62%")
+                // Title + detail, leading icon, expand/collapse, and a trailing
+                // actions slot (copy + close) — the full Red usage pattern.
+                Toast::new("Query failed")
+                    .variant(ToastVariant::Error)
+                    .icon("⚠")
+                    .detail(long)
+                    .width(px(280.))
+                    .expandable(true)
+                    .expanded(self.toast_expanded)
+                    .on_toggle({
+                        let view = view.clone();
+                        move |_, cx| {
+                            view.update(cx, |this, cx| {
+                                this.toast_expanded = !this.toast_expanded;
+                                cx.notify();
+                            })
+                        }
+                    })
+                    .actions(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(
+                                IconButton::new("toast-copy", "⧉")
+                                    .size(IconButtonSize::Sm)
+                                    .on_click(|_, _, _| {}),
+                            )
+                            .child(
+                                IconButton::new("toast-close", "✕")
+                                    .size(IconButtonSize::Sm)
+                                    .on_click(|_, _, _| {}),
+                            ),
+                    ),
+            )
+            .child(
+                Toast::new("Exporting…")
                     .variant(ToastVariant::Info)
+                    .icon("↓")
+                    .detail("3,128 rows")
                     .progress(0.62)
+                    .width(px(280.))
                     .on_close(|_, _| {}),
             )
+    }
+
+    fn selectable_label(&self) -> impl IntoElement {
+        div().max_w(px(360.)).child(self.selectable.clone())
     }
 
     fn tooltip_demo(&self) -> impl IntoElement {
@@ -1385,7 +1458,8 @@ impl Render for Gallery {
         let select = self.select(cx);
         let number_input = self.number_input();
         let context_menu = self.context_menu();
-        let toasts = self.toasts();
+        let toasts = self.toasts(cx);
+        let selectable_label = self.selectable_label();
         let tooltip = self.tooltip_demo();
         let split_pane = self.split_pane(cx);
         let tree = self.tree(cx);
@@ -1425,6 +1499,11 @@ impl Render for Gallery {
             .child(self.section("Number input", number_input, cx))
             .child(self.section("Context menu", context_menu, cx))
             .child(self.section("Toasts", toasts, cx))
+            .child(self.section(
+                "Selectable label (drag to highlight, ⌘/Ctrl+C to copy)",
+                selectable_label,
+                cx,
+            ))
             .child(self.section("Tooltip", tooltip, cx))
             .child(
                 self.section(
@@ -1640,6 +1719,7 @@ fn main() {
         Palette::bind_keys(cx);
         Switcher::bind_keys(cx);
         ComboBox::bind_keys(cx);
+        SelectableLabel::bind_keys(cx);
 
         // Kick off generation of the 2M-row SQLite table for spike A so it's
         // ready by the time anyone switches the streaming grid to it.

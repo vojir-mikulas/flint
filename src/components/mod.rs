@@ -21,6 +21,7 @@ pub mod progress_bar;
 pub mod scrollbar;
 pub mod segmented;
 pub mod select;
+pub mod selectable_label;
 pub mod split_pane;
 pub mod switcher;
 pub mod table;
