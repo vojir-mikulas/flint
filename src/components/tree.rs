@@ -11,8 +11,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, uniform_list, App, ClickEvent, FocusHandle, Pixels, SharedString,
-    UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list, App, ClickEvent, FocusHandle, MouseButton, Pixels, Point,
+    SharedString, UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -66,6 +66,9 @@ type SelectHandler = Rc<dyn Fn(usize, &ClickEvent, &mut Window, &mut App) + 'sta
 type IndexHandler = Rc<dyn Fn(usize, &mut Window, &mut App) + 'static>;
 /// Keyboard navigation handler — receives a [`TreeNav`] intent.
 type NavHandler = Rc<dyn Fn(TreeNav, &mut Window, &mut App) + 'static>;
+/// Secondary (right) click handler — the row index plus the cursor position, for
+/// anchoring a context menu.
+type SecondaryHandler = Rc<dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static>;
 /// Draws the disclosure indicator for a parent row, given its expanded state.
 type DisclosureRenderer = Rc<dyn Fn(bool, &mut Window, &mut App) -> gpui::AnyElement + 'static>;
 
@@ -84,6 +87,7 @@ pub struct Tree {
     scroll_handle: Option<UniformListScrollHandle>,
     focus_handle: Option<FocusHandle>,
     on_nav: Option<NavHandler>,
+    on_secondary: Option<SecondaryHandler>,
 }
 
 impl Tree {
@@ -102,6 +106,7 @@ impl Tree {
             scroll_handle: None,
             focus_handle: None,
             on_nav: None,
+            on_secondary: None,
         }
     }
 
@@ -191,6 +196,16 @@ impl Tree {
         self.on_nav = Some(Rc::new(handler));
         self
     }
+
+    /// Secondary (right-click) handler — fired with the row index and the cursor
+    /// position, for opening a context menu. Independent of select/toggle/activate.
+    pub fn on_secondary(
+        mut self,
+        handler: impl Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_secondary = Some(Rc::new(handler));
+        self
+    }
 }
 
 impl RenderOnce for Tree {
@@ -206,6 +221,7 @@ impl RenderOnce for Tree {
         let on_select = self.on_select.clone();
         let on_toggle = self.on_toggle.clone();
         let on_activate = self.on_activate.clone();
+        let on_secondary = self.on_secondary.clone();
         let selected = self.selected;
 
         // Token snapshot so the `'static` row closure doesn't borrow `cx`.
@@ -253,6 +269,7 @@ impl RenderOnce for Tree {
                 let on_select = on_select.clone();
                 let on_toggle = on_toggle.clone();
                 let on_activate = on_activate.clone();
+                let on_secondary = on_secondary.clone();
                 let has_children = item.has_children;
                 let clickable = on_select.is_some() || on_toggle.is_some() || on_activate.is_some();
 
@@ -296,6 +313,16 @@ impl RenderOnce for Tree {
                                     }
                                 }
                             })
+                        })
+                        .when(on_secondary.is_some(), |d| {
+                            d.cursor_pointer().on_mouse_down(
+                                MouseButton::Right,
+                                move |event, window, cx| {
+                                    if let Some(on_secondary) = on_secondary.as_ref() {
+                                        on_secondary(ix, event.position, window, cx);
+                                    }
+                                },
+                            )
                         })
                         .child(chevron)
                         .child(content),

@@ -71,6 +71,9 @@ pub struct SwitcherItem {
     pub dot: Option<Hsla>,
     /// Trailing state pill.
     pub badge: Option<SwitcherBadge>,
+    /// A trailing keyboard-hint pill (e.g. a quick-switch shortcut). Caller-formatted
+    /// so the switcher stays domain-free — the host localizes the modifier glyph.
+    pub kbd: Option<SharedString>,
     /// Draws a checkmark — the active / current row.
     pub checked: bool,
 }
@@ -83,6 +86,7 @@ impl SwitcherItem {
             detail: None,
             dot: None,
             badge: None,
+            kbd: None,
             checked: false,
         }
     }
@@ -99,6 +103,13 @@ impl SwitcherItem {
 
     pub fn badge(mut self, badge: SwitcherBadge) -> Self {
         self.badge = Some(badge);
+        self
+    }
+
+    /// A trailing keyboard-hint pill, e.g. the row's quick-switch shortcut. The
+    /// caller formats the glyph (`⌘1` / `Ctrl+1`) so the switcher stays domain-free.
+    pub fn kbd(mut self, hint: impl Into<SharedString>) -> Self {
+        self.kbd = Some(hint.into());
         self
     }
 
@@ -470,6 +481,10 @@ impl Render for Switcher {
         let font_base = theme.font_size;
         let font_sm = theme.font_size_sm();
         let micro = theme.font_size_micro();
+        let mono = theme.mono_family.clone();
+        let text_dim = theme.text_dim;
+        let kbd_bg = theme.bg_input;
+        let kbd_border = theme.border;
         let view = cx.entity().downgrade();
         let selected = self.selected;
 
@@ -517,6 +532,21 @@ impl Render for Switcher {
                     .text_color(accent)
                     .child("✓")
             });
+            // A trailing keyboard-hint pill (e.g. the row's quick-switch shortcut).
+            let kbd = item.kbd.clone().map(|hint| {
+                div()
+                    .flex_none()
+                    .px(px(5.))
+                    .py(px(1.))
+                    .rounded(radius_sm)
+                    .bg(kbd_bg)
+                    .border_1()
+                    .border_color(kbd_border)
+                    .font_family(mono.clone())
+                    .text_size(micro)
+                    .text_color(text_dim)
+                    .child(hint)
+            });
 
             div()
                 .id(("switcher-row", flat_ix))
@@ -533,6 +563,7 @@ impl Render for Switcher {
                 .child(label_block)
                 .when_some(badge, |this, badge| this.child(badge))
                 .when_some(check, |this, check| this.child(check))
+                .when_some(kbd, |this, kbd| this.child(kbd))
                 .on_click(move |_, _, cx| {
                     view.update(cx, |this, cx| this.activate(flat_ix, cx)).ok();
                 })

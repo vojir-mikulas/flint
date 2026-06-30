@@ -119,6 +119,8 @@ struct Gallery {
     selectable: Entity<SelectableLabel>,
     /// Toggles the expand/collapse state of the toast-with-body demo.
     toast_expanded: bool,
+    /// Whether the context-menu demo's hover-opened flyout is showing.
+    submenu_open: bool,
 }
 
 impl Gallery {
@@ -197,6 +199,7 @@ impl Gallery {
                             .detail("postgres · prod.db.internal")
                             .dot(green)
                             .badge(SwitcherBadge::new("warm", green))
+                            .kbd("⌘1")
                             .checked(true)],
                     ),
                     SwitcherSection::new(
@@ -205,11 +208,13 @@ impl Gallery {
                             SwitcherItem::new("conn:staging", "Staging")
                                 .detail("12m ago")
                                 .dot(blue)
-                                .badge(SwitcherBadge::new("cold", dim)),
+                                .badge(SwitcherBadge::new("cold", dim))
+                                .kbd("⌘2"),
                             SwitcherItem::new("conn:analytics", "Analytics")
                                 .detail("2h ago")
                                 .dot(purple)
-                                .badge(SwitcherBadge::new("cold", dim)),
+                                .badge(SwitcherBadge::new("cold", dim))
+                                .kbd("⌘3"),
                         ],
                     ),
                 ],
@@ -351,6 +356,7 @@ impl Gallery {
                 )
             }),
             toast_expanded: false,
+            submenu_open: false,
         }
     }
 
@@ -715,11 +721,26 @@ impl Gallery {
         self.number.clone()
     }
 
-    fn context_menu(&self) -> impl IntoElement {
+    fn context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // "Move to" is a hover-opened flyout: the caller owns the open flag and
+        // resets it elsewhere (here, never — the demo menu is always shown). A long
+        // flyout (or main menu) caps to the viewport and scrolls.
+        let mut move_to = Submenu::new("move-to", "Move to")
+            .open(self.submenu_open)
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if *hovered && !this.submenu_open {
+                    this.submenu_open = true;
+                    cx.notify();
+                }
+            }));
+        for folder in ["Documents", "Downloads", "Projects", "Archive", "Trash"] {
+            move_to = move_to.item(ContextMenuItem::new(folder, folder));
+        }
         ContextMenu::new("demo-menu")
             .item(ContextMenuItem::new("download", "Download").shortcut("⌘D"))
             .item(ContextMenuItem::new("rename", "Rename").shortcut("F2"))
             .item(ContextMenuItem::new("copy-path", "Copy path"))
+            .submenu(move_to)
             .separator()
             .item(
                 ContextMenuItem::new("delete", "Delete")
@@ -1457,7 +1478,7 @@ impl Render for Gallery {
         let segmented = self.segmented(cx);
         let select = self.select(cx);
         let number_input = self.number_input();
-        let context_menu = self.context_menu();
+        let context_menu = self.context_menu(cx);
         let toasts = self.toasts(cx);
         let selectable_label = self.selectable_label();
         let tooltip = self.tooltip_demo();

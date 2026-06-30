@@ -27,7 +27,7 @@ pub use components::code_editor::{
     RichCompletionProvider, TokenStyle,
 };
 pub use components::combo_box::{ComboBox, ComboBoxEvent};
-pub use components::context_menu::{ContextMenu, ContextMenuItem};
+pub use components::context_menu::{ContextMenu, ContextMenuItem, Submenu};
 pub use components::floating::{floating, Floating};
 pub use components::icon_button::{IconButton, IconButtonSize};
 pub use components::markdown_editor::{CompletionTrigger, MarkdownEditor, MarkdownEditorEvent};
@@ -63,7 +63,7 @@ pub mod prelude {
         Highlighter, RichCompletionProvider, TokenStyle,
     };
     pub use crate::components::combo_box::{ComboBox, ComboBoxEvent};
-    pub use crate::components::context_menu::{ContextMenu, ContextMenuItem};
+    pub use crate::components::context_menu::{ContextMenu, ContextMenuItem, Submenu};
     pub use crate::components::floating::{floating, Floating};
     pub use crate::components::icon_button::{IconButton, IconButtonSize};
     pub use crate::components::markdown_editor::{
