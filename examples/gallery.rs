@@ -119,8 +119,6 @@ struct Gallery {
     selectable: Entity<SelectableLabel>,
     /// Toggles the expand/collapse state of the toast-with-body demo.
     toast_expanded: bool,
-    /// Whether the context-menu demo's hover-opened flyout is showing.
-    submenu_open: bool,
 }
 
 impl Gallery {
@@ -356,7 +354,6 @@ impl Gallery {
                 )
             }),
             toast_expanded: false,
-            submenu_open: false,
         }
     }
 
@@ -721,18 +718,11 @@ impl Gallery {
         self.number.clone()
     }
 
-    fn context_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // "Move to" is a hover-opened flyout: the caller owns the open flag and
-        // resets it elsewhere (here, never — the demo menu is always shown). A long
-        // flyout (or main menu) caps to the viewport and scrolls.
-        let mut move_to = Submenu::new("move-to", "Move to")
-            .open(self.submenu_open)
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if *hovered && !this.submenu_open {
-                    this.submenu_open = true;
-                    cx.notify();
-                }
-            }));
+    fn context_menu(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        // "Move to" is a hover-opened flyout: `ContextMenu` opens it when the row
+        // is entered and closes it when a sibling is. A long flyout (or main menu)
+        // caps to the viewport and scrolls.
+        let mut move_to = Submenu::new("move-to", "Move to");
         for folder in ["Documents", "Downloads", "Projects", "Archive", "Trash"] {
             move_to = move_to.item(ContextMenuItem::new(folder, folder));
         }

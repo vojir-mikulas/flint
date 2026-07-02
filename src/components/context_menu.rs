@@ -11,7 +11,7 @@
 //! itself stays a stateless `RenderOnce`.
 
 use gpui::{
-    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, ClickEvent, Div, Pixels,
+    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, ClickEvent, Div, Entity, Pixels,
     SharedString, Stateful, Window,
 };
 
@@ -20,7 +20,10 @@ use crate::styled_ext::StyledExt;
 use crate::theme::{ActiveTheme, Theme};
 
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
-type HoverHandler = Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>;
+
+/// Which submenu (by key) is currently flown out. Owned internally by
+/// [`ContextMenu`] via `use_keyed_state`, so it resets when the menu closes.
+type OpenSubmenu = Entity<Option<SharedString>>;
 
 pub struct ContextMenuItem {
     key: SharedString,
@@ -68,16 +71,14 @@ impl ContextMenuItem {
     }
 }
 
-/// A nested menu that flies out from a parent row. The caller controls
-/// [`open`](Self::open) and [`on_hover`](Self::on_hover) so [`ContextMenu`] can
-/// stay stateless: the typical wiring is `on_hover` → set a `bool` on the owning
-/// view → feed it back as `open`. The flyout is anchored to the parent row's
-/// measured right edge and is deferred, so it escapes the menu's scroll clip.
+/// A nested menu that flies out from a parent row. [`ContextMenu`] tracks which
+/// submenu is open itself (keyed on this `key`): entering the parent row opens
+/// the flyout, and entering any *sibling* row closes it again — no caller state
+/// required. The flyout is anchored to the parent row's measured right edge and
+/// is deferred, so it escapes the menu's scroll clip.
 pub struct Submenu {
     key: SharedString,
     label: SharedString,
-    open: bool,
-    on_hover: Option<HoverHandler>,
     items: Vec<ContextMenuItem>,
 }
 
@@ -87,22 +88,8 @@ impl Submenu {
         Self {
             key: key.into(),
             label: label.into(),
-            open: false,
-            on_hover: None,
             items: Vec::new(),
         }
-    }
-
-    /// Whether the flyout is shown. Owned by the caller's view state.
-    pub fn open(mut self, open: bool) -> Self {
-        self.open = open;
-        self
-    }
-
-    /// Fired with `true` when the parent row is entered, `false` when left.
-    pub fn on_hover(mut self, handler: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
-        self.on_hover = Some(Box::new(handler));
-        self
     }
 
     pub fn item(mut self, item: ContextMenuItem) -> Self {
@@ -156,14 +143,28 @@ impl RenderOnce for ContextMenu {
         // running off its top or bottom.
         let max_h = (window.viewport_size().height - px(16.)).max(px(120.));
 
+        // Which submenu is flown out, tracked internally. `use_keyed_state` is
+        // retained only while the menu is on screen, so this resets to `None`
+        // whenever the menu closes — no stale flyout on the next open.
+        let open_state: OpenSubmenu = window.use_keyed_state(
+            SharedString::from(format!("{menu_id}__open_sub")),
+            cx,
+            |_, _| None,
+        );
+        let open_key = open_state.read(cx).clone();
+
         // Rows are built imperatively because a submenu needs `&mut Window`/`&mut
         // App` (to measure its anchor) — which a `map` closure can't thread.
         let mut rows: Vec<AnyElement> = Vec::with_capacity(self.entries.len());
         for entry in self.entries {
             rows.push(match entry {
                 Entry::Separator => separator_el(&theme),
-                Entry::Item(item) => item_el(item, &theme),
-                Entry::Submenu(sub) => submenu_el(sub, max_h, &theme, window, cx),
+                // A top-level row hovering closes any open flyout (`hover_open` =
+                // None); a submenu opens its own.
+                Entry::Item(item) => item_el(item, open_state.clone(), None, &theme),
+                Entry::Submenu(sub) => {
+                    submenu_el(sub, open_state.clone(), open_key.clone(), max_h, &theme, window, cx)
+                }
             });
         }
 
@@ -200,7 +201,18 @@ fn separator_el(theme: &Theme) -> AnyElement {
 }
 
 /// A single clickable (or disabled) menu row.
-fn item_el(item: ContextMenuItem, theme: &Theme) -> AnyElement {
+///
+/// `hover_open` is the value written to the shared open-submenu state when this
+/// row is entered: `None` for a top-level row (so hovering it collapses any open
+/// flyout), or `Some(parent_key)` for a row *inside* a flyout (so hovering its
+/// own items keeps the flyout up). This is what makes an open submenu close when
+/// the cursor moves to a neighbouring item.
+fn item_el(
+    item: ContextMenuItem,
+    open_state: OpenSubmenu,
+    hover_open: Option<SharedString>,
+    theme: &Theme,
+) -> AnyElement {
     let base_color = if item.danger { theme.red } else { theme.text };
     let hover_bg = if item.danger { theme.red } else { theme.accent };
     let hover_fg = theme.on_accent;
@@ -221,6 +233,16 @@ fn item_el(item: ContextMenuItem, theme: &Theme) -> AnyElement {
                     .text_color(theme.text_faint)
                     .child(sc),
             )
+        })
+        .on_hover(move |hovered, _, cx| {
+            if *hovered {
+                open_state.update(cx, |cur, cx| {
+                    if *cur != hover_open {
+                        cur.clone_from(&hover_open);
+                        cx.notify();
+                    }
+                });
+            }
         });
 
     if item.disabled {
@@ -241,13 +263,18 @@ fn item_el(item: ContextMenuItem, theme: &Theme) -> AnyElement {
 /// menu's content width or scroll offset.
 fn submenu_el(
     sub: Submenu,
+    open_state: OpenSubmenu,
+    open_key: Option<SharedString>,
     max_h: Pixels,
     theme: &Theme,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    let key = sub.key;
+    let is_open = open_key.as_ref() == Some(&key);
+
     let bounds_state = window.use_keyed_state(
-        SharedString::from(format!("{}__sub_bounds", sub.key)),
+        SharedString::from(format!("{key}__sub_bounds")),
         cx,
         |_, _| None::<Bounds<Pixels>>,
     );
@@ -258,7 +285,7 @@ fn submenu_el(
     let hover_fg = theme.on_accent;
 
     let mut row = div()
-        .id(sub.key.clone())
+        .id(key.clone())
         .relative()
         .flex()
         .items_center()
@@ -293,27 +320,40 @@ fn submenu_el(
             .size_full(),
         );
 
-    if sub.open {
+    if is_open {
         // Keep the row lit while its flyout stands open.
         row = row.bg(hover_bg).text_color(hover_fg);
     } else {
         row = row.hover(move |s| s.bg(hover_bg).text_color(hover_fg));
     }
-    if let Some(handler) = sub.on_hover {
-        row = row.on_hover(move |hovered, window, cx| handler(hovered, window, cx));
-    }
+    // Entering the parent row opens this submenu (and, via the shared state,
+    // closes any other that was open).
+    let hover_state = open_state.clone();
+    let hover_key = key.clone();
+    row = row.on_hover(move |hovered, _, cx| {
+        if *hovered {
+            hover_state.update(cx, |cur, cx| {
+                if cur.as_ref() != Some(&hover_key) {
+                    *cur = Some(hover_key.clone());
+                    cx.notify();
+                }
+            });
+        }
+    });
 
-    let open = sub.open;
     let items = sub.items;
-    let sub_id = SharedString::from(format!("{}__flyout", sub.key));
+    let sub_id = SharedString::from(format!("{key}__flyout"));
     let flyout_theme = theme.clone();
+    // Flyout rows report `Some(key)` on hover so moving the cursor across them
+    // keeps this submenu open rather than collapsing it.
+    let flyout_open = Some(key);
     div()
         .child(row)
-        .when(open, move |this| match anchor {
+        .when(is_open, move |this| match anchor {
             Some(b) => {
                 let rows = items
                     .into_iter()
-                    .map(|it| item_el(it, &flyout_theme))
+                    .map(|it| item_el(it, open_state.clone(), flyout_open.clone(), &flyout_theme))
                     .collect::<Vec<_>>();
                 let flyout = surface(sub_id, max_h, &flyout_theme)
                     .occlude()
