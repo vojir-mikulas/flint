@@ -347,7 +347,13 @@ fn submenu_el(
     // Flyout rows report `Some(key)` on hover so moving the cursor across them
     // keeps this submenu open rather than collapsing it.
     let flyout_open = Some(key);
+    // Stack as a full-width column so the parent row fills the menu like every
+    // other item (a plain flex-row wrapper would shrink it to content width).
+    // That also puts the row's measured right edge at the menu edge, so the
+    // flyout anchors beside the menu instead of overlapping it.
     div()
+        .flex()
+        .flex_col()
         .child(row)
         .when(is_open, move |this| match anchor {
             Some(b) => {
