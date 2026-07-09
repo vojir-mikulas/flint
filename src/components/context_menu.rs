@@ -162,9 +162,15 @@ impl RenderOnce for ContextMenu {
                 // A top-level row hovering closes any open flyout (`hover_open` =
                 // None); a submenu opens its own.
                 Entry::Item(item) => item_el(item, open_state.clone(), None, &theme),
-                Entry::Submenu(sub) => {
-                    submenu_el(sub, open_state.clone(), open_key.clone(), max_h, &theme, window, cx)
-                }
+                Entry::Submenu(sub) => submenu_el(
+                    sub,
+                    open_state.clone(),
+                    open_key.clone(),
+                    max_h,
+                    &theme,
+                    window,
+                    cx,
+                ),
             });
         }
 

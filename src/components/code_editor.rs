@@ -26,6 +26,7 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::components::floating::floating;
+use crate::components::scrollbar::{Scrollbar, ScrollbarState};
 use crate::theme::{ActiveTheme, Theme};
 
 actions!(
@@ -300,6 +301,11 @@ pub struct CodeEditor {
     /// Drives the scroll container so caret-follow autoscroll can read the viewport
     /// and nudge the offset when the caret lands outside it.
     scroll_handle: ScrollHandle,
+    /// In-flight drag state for the code surface's vertical scrollbar.
+    scrollbar: ScrollbarState,
+    /// Drives the completion popup's scroll container so arrow-key navigation can
+    /// scroll a selected candidate below the fold into view, and the wheel works.
+    completion_scroll: ScrollHandle,
     /// Set by an edit or caret move; the next paint scrolls the caret back into view
     /// (then clears it). Gating on this — rather than scrolling every frame — lets the
     /// user wheel-scroll away from the caret without it snapping back.
@@ -343,6 +349,8 @@ impl CodeEditor {
             last_edit: EditKind::Other,
             last_edit_caret: 0,
             scroll_handle: ScrollHandle::new(),
+            scrollbar: ScrollbarState::new(),
+            completion_scroll: ScrollHandle::new(),
             scroll_to_cursor: false,
             last_bounds: None,
             last_lines: Vec::new(),
@@ -772,6 +780,8 @@ impl CodeEditor {
                 candidates,
                 selected: 0,
             });
+            // A fresh popup starts at the top, not wherever the last one was left.
+            self.completion_scroll.set_offset(point(px(0.), px(0.)));
         }
     }
 
@@ -798,6 +808,9 @@ impl CodeEditor {
         if let Some(c) = &mut self.completion {
             let n = c.candidates.len() as isize;
             c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
+            // Keep the highlighted row visible as selection walks past the fold
+            // (the popup list is a capped, scrollable container).
+            self.completion_scroll.scroll_to_item(c.selected);
             cx.notify();
         }
     }
@@ -1986,12 +1999,19 @@ impl Render for CodeEditor {
             let c = self.completion.as_ref()?;
             // Candidate list (left column). Each row: kind badge · label · dim detail.
             let list = div()
+                .id("completion-list")
                 .flex()
                 .flex_col()
                 .w(px(236.))
                 .flex_none()
+                // Cap the height so a long candidate list scrolls inside the popup
+                // instead of running off the window; the wheel and arrow-key
+                // scroll-into-view both ride this handle.
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .track_scroll(&self.completion_scroll)
                 .py_1()
-                .children(c.candidates.iter().take(8).enumerate().map(|(i, item)| {
+                .children(c.candidates.iter().enumerate().map(|(i, item)| {
                     let badge = item.kind.badge(theme);
                     div()
                         .flex()
@@ -2085,6 +2105,33 @@ impl Render for CodeEditor {
         // input handler registered in prepaint (`handle_input` above).
         let a11y_id = ElementId::from(&self.focus_handle);
         let a11y_label = self.a11y_label.clone();
+
+        // Vertical scrollbar over the code surface, derived from the scroll
+        // handle's measured viewport + max offset (so it appears only when the
+        // content overflows) and scrubbing it drives the same handle. Mirrors the
+        // fraction-based control the result grid uses.
+        let max = f32::from(self.scroll_handle.max_offset().y);
+        let view = f32::from(self.scroll_handle.bounds().size.height);
+        let (fraction, thumb) = if max > 0. && view > 0. {
+            (
+                (-f32::from(self.scroll_handle.offset().y) / max).clamp(0., 1.),
+                view / (view + max),
+            )
+        } else {
+            (0., 1.)
+        };
+        let scrub_handle = self.scroll_handle.clone();
+        let scrollbar = Scrollbar::new("code-scrollbar", &self.scrollbar)
+            .fraction(fraction)
+            .thumb(thumb)
+            .on_scrub(move |f, window, _| {
+                let max = scrub_handle.max_offset().y;
+                let mut offset = scrub_handle.offset();
+                offset.y = -(max * f);
+                scrub_handle.set_offset(offset);
+                window.refresh();
+            });
+
         div()
             .relative()
             .flex()
@@ -2152,6 +2199,7 @@ impl Render for CodeEditor {
             // still wins mouse hits — the empty editor stays clickable to focus.
             .children(placeholder)
             .child(scroll_area)
+            .child(scrollbar)
             .children(popup)
     }
 }
