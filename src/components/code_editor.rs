@@ -21,7 +21,8 @@ use gpui::{
     CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role,
-    ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, Window, WrappedLine,
+    ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -121,6 +122,52 @@ impl TokenStyle {
 /// Maps source text to `(byte range, style)` spans. Gaps render in the default
 /// text color.
 pub type Highlighter = Rc<dyn Fn(&str) -> Vec<(Range<usize>, TokenStyle)>>;
+
+/// The severity of a [`Decoration`], mapped to a theme colour. Generic (no SQL
+/// knowledge); the owner classifies its own findings onto these.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DecorationStyle {
+    Error,
+    Warning,
+    Info,
+}
+
+impl DecorationStyle {
+    fn color(self, t: &Theme) -> Hsla {
+        match self {
+            DecorationStyle::Error => t.red,
+            DecorationStyle::Warning => t.yellow,
+            DecorationStyle::Info => t.blue,
+        }
+    }
+}
+
+/// A visual mark over a byte range, independent of syntax highlighting: the owner
+/// (e.g. RED) supplies these to flag diagnostics — an unknown table, a bad column.
+/// Drawn as a wavy underline in the severity's colour, riding the shaped text so it
+/// tracks the glyphs exactly.
+#[derive(Clone)]
+pub struct Decoration {
+    pub range: Range<usize>,
+    pub style: DecorationStyle,
+}
+
+/// Maps source text to a set of [`Decoration`]s. Like [`Highlighter`], it's re-run
+/// each paint against the current text, so marks track edits with no owner-side
+/// subscription. Domain-free — RED resolves identifiers against its schema; the
+/// editor only draws the ranges it's handed.
+pub type DecorationProvider = Rc<dyn Fn(&str) -> Vec<Decoration>>;
+
+/// Maps the buffer text and the byte offset under the pointer to hover text, or
+/// `None` for nothing to show. The editor owns the geometry and renders the
+/// tooltip near that offset; the owner only supplies the text (a table's columns,
+/// a column's type, a diagnostic message). `\n` splits into lines. Domain-free.
+pub type HoverProvider = Rc<dyn Fn(&str, usize) -> Option<SharedString>>;
+
+/// Maps buffer text to the 0-based line numbers that get a run marker (▶) in the
+/// gutter — e.g. each statement's first line. Clicking a marker emits
+/// [`CodeEditorEvent::RunLine`]. Re-run each render. Domain-free.
+pub type GutterMarkerProvider = Rc<dyn Fn(&str) -> Vec<usize>>;
 
 /// The completion seam: given the full text and the cursor's byte offset, return
 /// candidate completions for the word ending at the cursor. The editor replaces
@@ -222,6 +269,10 @@ pub enum CodeEditorEvent {
     /// Esc with no completion popup open — the owner can move focus elsewhere
     /// (the completion-dismiss case is handled internally and emits nothing).
     Escape,
+    /// A gutter run-marker was clicked; the payload is the 0-based line it sits on.
+    /// The owner runs the statement starting there. Only lines the gutter-marker
+    /// provider flagged carry a marker.
+    RunLine(usize),
 }
 
 /// An open completion popup: the word being completed starts at `start` (replaced
@@ -280,6 +331,16 @@ pub struct CodeEditor {
     /// is always drawn.
     resting_border: bool,
     highlighter: Option<Highlighter>,
+    /// Recomputes diagnostic [`Decoration`]s from the current text each paint
+    /// (wavy underlines). Independent of the highlighter.
+    decoration_provider: Option<DecorationProvider>,
+    /// Supplies hover text for the byte offset under the pointer (peek tooltip).
+    hover_provider: Option<HoverProvider>,
+    /// Flags gutter lines that get a run marker (▶); a click emits `RunLine`.
+    gutter_marker_provider: Option<GutterMarkerProvider>,
+    /// The byte offset under the pointer, tracked while a [`hover_provider`] is set
+    /// so the tooltip follows the mouse. Cleared when the pointer leaves.
+    hovered: Option<usize>,
     completion_provider: Option<CompletionProvider>,
     /// A richer provider that supersedes [`completion_provider`](Self::completion_provider)
     /// when set — its items carry a kind badge, detail, and documentation.
@@ -339,6 +400,10 @@ impl CodeEditor {
             corner_radius: None,
             resting_border: true,
             highlighter: None,
+            decoration_provider: None,
+            hover_provider: None,
+            hovered: None,
+            gutter_marker_provider: None,
             completion_provider: None,
             rich_provider: None,
             completion_detail: None,
@@ -424,6 +489,52 @@ impl CodeEditor {
         f: impl Fn(&str) -> Vec<(Range<usize>, TokenStyle)> + 'static,
     ) -> Self {
         self.highlighter = Some(Rc::new(f));
+        self
+    }
+
+    /// Install the diagnostics seam: a closure that maps the buffer text to a set
+    /// of [`Decoration`]s, re-run each paint so marks track edits. See
+    /// [`Self::set_decorations`] to replace it after construction.
+    pub fn decorations(mut self, f: impl Fn(&str) -> Vec<Decoration> + 'static) -> Self {
+        self.decoration_provider = Some(Rc::new(f));
+        self
+    }
+
+    /// Replace the diagnostics provider after construction — RED rebuilds it as the
+    /// schema loads, so validation sharpens without recreating the editor.
+    pub fn set_decorations(
+        &mut self,
+        f: impl Fn(&str) -> Vec<Decoration> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.decoration_provider = Some(Rc::new(f));
+        cx.notify();
+    }
+
+    /// Install the hover-peek seam: a closure mapping the byte offset under the
+    /// pointer to tooltip text (`\n`-split into lines), rendered near that offset.
+    /// See [`Self::set_hover`] to replace it after construction.
+    pub fn hover(mut self, f: impl Fn(&str, usize) -> Option<SharedString> + 'static) -> Self {
+        self.hover_provider = Some(Rc::new(f));
+        self
+    }
+
+    /// Replace the hover-peek provider after construction — RED rebuilds it as the
+    /// schema loads, so peeks gain detail without recreating the editor.
+    pub fn set_hover(
+        &mut self,
+        f: impl Fn(&str, usize) -> Option<SharedString> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.hover_provider = Some(Rc::new(f));
+        cx.notify();
+    }
+
+    /// Install the gutter run-marker seam: a closure returning the 0-based lines
+    /// that get a ▶ (e.g. each statement's first line). A click emits
+    /// [`CodeEditorEvent::RunLine`]. Recomputed each render, so markers track edits.
+    pub fn gutter_markers(mut self, f: impl Fn(&str) -> Vec<usize> + 'static) -> Self {
+        self.gutter_marker_provider = Some(Rc::new(f));
         self
     }
 
@@ -1183,6 +1294,7 @@ impl CodeEditor {
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.is_selecting = true;
         self.desired_col = None;
+        self.hovered = None;
         let offset = self.index_for_mouse_position(event.position);
         match event.click_count {
             // Triple-click: select the line; dragging then extends line by line.
@@ -1222,6 +1334,18 @@ impl CodeEditor {
     }
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting {
+            // Hover tracking for the peek tooltip: the byte offset under the pointer
+            // (while it's inside the text bounds), re-rendered only when it changes.
+            if self.hover_provider.is_some() {
+                let inside = self
+                    .last_bounds
+                    .is_some_and(|b| b.contains(&event.position));
+                let hovered = inside.then(|| self.index_for_mouse_position(event.position));
+                if hovered != self.hovered {
+                    self.hovered = hovered;
+                    cx.notify();
+                }
+            }
             return;
         }
         let offset = self.index_for_mouse_position(event.position);
@@ -1236,6 +1360,21 @@ impl CodeEditor {
             }
             _ => self.select_to(offset, cx),
         }
+    }
+
+    /// The tooltip anchor for the byte `offset`: just below its line, at its column
+    /// x, in window space (from the last paint's cached geometry). Mirrors
+    /// [`Self::completion_anchor`].
+    fn hover_anchor(&self, offset: usize) -> Option<Point<Pixels>> {
+        let bounds = self.last_bounds?;
+        if self.last_lines.is_empty() {
+            return None;
+        }
+        let (line, col) = self.line_col(offset);
+        let line = line.min(self.last_lines.len() - 1);
+        let x = self.last_lines[line].x_for_index(col);
+        let y = self.last_line_height * (line as f32 + 1.0) + px(2.);
+        Some(bounds.origin + point(x, y))
     }
 
     /// The byte range of the word containing (or adjacent to) `offset`. Empty when
@@ -1576,6 +1715,11 @@ impl Element for CodeElement {
             .as_ref()
             .map(|h| h(&content))
             .unwrap_or_default();
+        let decorations = editor
+            .decoration_provider
+            .as_ref()
+            .map(|p| p(&content))
+            .unwrap_or_default();
         let ranges = editor.line_ranges();
 
         let text_style = window.text_style();
@@ -1585,25 +1729,16 @@ impl Element for CodeElement {
 
         // --- soft-wrap path: one wrapped layout per logical line, stacked ---
         if editor.soft_wrap {
-            // Runs over the whole content (token colors; gaps default), as shape_text
-            // splits on newlines itself and wants runs covering the full text.
-            let mut runs: Vec<TextRun> = Vec::new();
-            let mut pos = 0usize;
-            for (tr, style) in &tokens {
-                let s = tr.start.min(content.len());
-                let e = tr.end.min(content.len());
-                if s >= e || s < pos {
-                    continue;
-                }
-                if s > pos {
-                    runs.push(text_run(s - pos, &font, default_color));
-                }
-                runs.push(text_run(e - s, &font, style.color(&theme)));
-                pos = e;
-            }
-            if pos < content.len() {
-                runs.push(text_run(content.len() - pos, &font, default_color));
-            }
+            // Runs over the whole content (shape_text splits on newlines itself and
+            // wants runs covering the full text): token colours + diagnostic underlines.
+            let mut runs = shape_runs(
+                0..content.len(),
+                &tokens,
+                &decorations,
+                &font,
+                default_color,
+                &theme,
+            );
             if runs.is_empty() {
                 runs.push(text_run(content.len(), &font, default_color));
             }
@@ -1703,27 +1838,11 @@ impl Element for CodeElement {
             };
         }
 
-        // Shape each line with per-token colored runs (gaps fall back to default).
+        // Shape each line: token colours, plus diagnostic underlines from decorations.
         let mut lines = Vec::with_capacity(ranges.len());
         for r in &ranges {
             let (ls, le) = (r.start, r.end);
-            let mut runs: Vec<TextRun> = Vec::new();
-            let mut pos = ls;
-            for (tr, style) in &tokens {
-                let s = tr.start.max(ls);
-                let e = tr.end.min(le);
-                if s >= e {
-                    continue;
-                }
-                if s > pos {
-                    runs.push(text_run(s - pos, &font, default_color));
-                }
-                runs.push(text_run(e - s, &font, style.color(&theme)));
-                pos = e;
-            }
-            if pos < le {
-                runs.push(text_run(le - pos, &font, default_color));
-            }
+            let runs = shape_runs(ls..le, &tokens, &decorations, &font, default_color, &theme);
             let line_text = SharedString::from(content[ls..le].to_string());
             lines.push(
                 window
@@ -1877,6 +1996,67 @@ fn text_run(len: usize, font: &gpui::Font, color: Hsla) -> TextRun {
     }
 }
 
+/// Build the `TextRun`s for byte range `[start, end)` of the buffer: coloured by
+/// `tokens` (gaps fall back to `default_color`) and wavy-underlined where a
+/// `decoration` covers. Runs are cut at the union of token and decoration
+/// boundaries, so each run is uniform in both colour and underline. Returns empty
+/// for an empty range (an empty line shapes with no runs).
+fn shape_runs(
+    range: Range<usize>,
+    tokens: &[(Range<usize>, TokenStyle)],
+    decorations: &[Decoration],
+    font: &gpui::Font,
+    default_color: Hsla,
+    theme: &Theme,
+) -> Vec<TextRun> {
+    let (ls, le) = (range.start, range.end);
+    if ls >= le {
+        return Vec::new();
+    }
+    let mut cuts = vec![ls, le];
+    let mut add = |p: usize| {
+        if p > ls && p < le {
+            cuts.push(p);
+        }
+    };
+    for (tr, _) in tokens {
+        add(tr.start);
+        add(tr.end);
+    }
+    for d in decorations {
+        add(d.range.start);
+        add(d.range.end);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut runs = Vec::with_capacity(cuts.len().saturating_sub(1));
+    for w in cuts.windows(2) {
+        let (s, e) = (w[0], w[1]);
+        let color = tokens
+            .iter()
+            .find(|(tr, _)| tr.start <= s && s < tr.end)
+            .map_or(default_color, |(_, style)| style.color(theme));
+        let underline = decorations
+            .iter()
+            .find(|d| d.range.start <= s && s < d.range.end)
+            .map(|d| UnderlineStyle {
+                color: Some(d.style.color(theme)),
+                thickness: px(1.),
+                wavy: true,
+            });
+        runs.push(TextRun {
+            len: e - s,
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline,
+            strikethrough: None,
+        });
+    }
+    runs
+}
+
 /// Total visual rows `content` occupies when soft-wrapped to `wrap_width`: the sum
 /// over logical lines of (wrap boundaries + 1). Used to size the soft-wrap element's
 /// height. Color is irrelevant here — only the wrap geometry matters.
@@ -1939,8 +2119,17 @@ impl Render for CodeEditor {
         let gutter_fg = theme.text_faint;
         let border = theme.border_soft;
 
+        // Lines that get a run marker (▶) — e.g. each statement's first line.
+        let markers: std::collections::HashSet<usize> = self
+            .gutter_marker_provider
+            .as_ref()
+            .map(|p| p(&self.content).into_iter().collect())
+            .unwrap_or_default();
+        let accent = theme.accent;
+
         // Line-number gutter (plain divs; scrolls with the code as a flex sibling).
-        // Suppressed on a prose surface (see [`Self::gutter`]).
+        // A marker line leads with a clickable ▶ that emits `RunLine`; other lines
+        // get a spacer so the numbers stay aligned. Suppressed on a prose surface.
         let gutter = self.gutter.then(|| {
             div()
                 .flex()
@@ -1949,15 +2138,44 @@ impl Render for CodeEditor {
                 .border_r_1()
                 .border_color(border)
                 .children((1..=line_count).map(|n| {
+                    let line = n - 1;
+                    let is_marker = markers.contains(&line);
                     div()
                         .h(line_height)
                         .min_w(px(48.))
-                        .px_3()
+                        .px_2()
                         .flex()
                         .items_center()
-                        .justify_end()
-                        .text_color(gutter_fg)
-                        .child(n.to_string())
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .id(("run-line", n))
+                                .w(px(11.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .when(is_marker, |d| {
+                                    d.cursor(CursorStyle::PointingHand)
+                                        .text_color(gutter_fg)
+                                        .hover(|s| s.text_color(accent))
+                                        .child("▶")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |_this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                cx.emit(CodeEditorEvent::RunLine(line));
+                                            }),
+                                        )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .justify_end()
+                                .text_color(gutter_fg)
+                                .child(n.to_string()),
+                        )
                 }))
         });
 
@@ -2100,6 +2318,32 @@ impl Render for CodeEditor {
             Some(floating(panel).at(at))
         });
 
+        // Peek tooltip, anchored under the hovered token. Suppressed while the
+        // completion popup is open so the two never fight for the same spot.
+        let hover_popup = self
+            .hovered
+            .filter(|_| self.completion.is_none())
+            .and_then(|offset| {
+                let text = self.hover_provider.as_ref()?(&self.content, offset)?;
+                let at = self.hover_anchor(offset)?;
+                let panel = div()
+                    .max_w(px(340.))
+                    .bg(theme.bg_elevated)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(theme.radius_sm)
+                    .shadow_lg()
+                    .px(px(10.))
+                    .py(px(6.))
+                    .text_size(px(12.))
+                    .text_color(theme.text_muted)
+                    .children(
+                        text.split('\n')
+                            .map(|line| div().child(SharedString::from(line.to_string()))),
+                    );
+                Some(floating(panel).at(at))
+            });
+
         // A11y: a multi-line text-input node keyed off the focus handle. The
         // editor content is read by assistive technology through the platform
         // input handler registered in prepaint (`handle_input` above).
@@ -2195,11 +2439,18 @@ impl Render for CodeEditor {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            // Dismiss the peek tooltip when the pointer leaves the editor.
+            .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                if !*hovered && this.hovered.take().is_some() {
+                    cx.notify();
+                }
+            }))
             // Placeholder first so the (transparent) scroll area paints over it and
             // still wins mouse hits — the empty editor stays clickable to focus.
             .children(placeholder)
             .child(scroll_area)
             .child(scrollbar)
             .children(popup)
+            .children(hover_popup)
     }
 }

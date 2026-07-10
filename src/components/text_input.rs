@@ -43,6 +43,8 @@ actions!(
         SelectEnd,
         FocusNext,
         FocusPrev,
+        Up,
+        Down,
         Submit,
         Cancel,
         ShowCharacterPalette,
@@ -86,6 +88,20 @@ pub enum TextInputEvent {
     /// Programmatic [`TextInput::set_content`] deliberately does **not** emit this,
     /// so owners can mirror one field into another without an echo loop.
     Change,
+    /// Tab pressed, when the field opted in via [`TextInput::emit_tab`]. The field
+    /// does *not* move focus itself; the owner decides what "next" means (e.g.
+    /// advance to the next grid cell). Ordinary fields leave this off and Tab
+    /// walks the focus ring as usual.
+    Tab,
+    /// Shift-Tab pressed, under the same [`TextInput::emit_tab`] opt-in as [`Tab`].
+    BackTab,
+    /// Up arrow, when the field opted in via [`TextInput::emit_nav`]. A single-line
+    /// field has no vertical motion of its own, so the owner uses this to move a
+    /// selection in an attached list (e.g. an in-cell suggestion dropdown). Fields
+    /// that don't opt in leave Up/Down to propagate as before.
+    Up,
+    /// Down arrow, under the same [`TextInput::emit_nav`] opt-in as [`Up`].
+    Down,
 }
 
 pub struct TextInput {
@@ -110,6 +126,14 @@ pub struct TextInput {
     is_selecting: bool,
     obscured: bool,
     tab_stop: bool,
+    /// When set, Tab/Shift-Tab emit [`TextInputEvent::Tab`]/[`BackTab`] instead of
+    /// moving window focus, so the owner can drive its own navigation (e.g. the
+    /// next editable grid cell). Default `false` keeps standard focus traversal.
+    emit_tab: bool,
+    /// When set, Up/Down emit [`TextInputEvent::Up`]/[`Down`] (via an extra
+    /// `TextInputNav` key context) so the owner can move a selection in an attached
+    /// list. Default `false` leaves Up/Down to propagate to ancestors as before.
+    emit_nav: bool,
     /// Borderless, transparent-background variant for embedding in a styled
     /// container (e.g. a command palette's input row). The parent owns the chrome.
     bare: bool,
@@ -148,6 +172,8 @@ impl TextInput {
             obscured: false,
             // Tab stop by default so `window.focus_next/prev` walks form fields.
             tab_stop: true,
+            emit_tab: false,
+            emit_nav: false,
             bare: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -163,6 +189,22 @@ impl TextInput {
         // Keep the handle in sync — it's the source of truth for tab order (see
         // `new`), so a standalone field opting out must clear it here too.
         self.focus_handle = self.focus_handle.clone().tab_stop(tab_stop);
+        self
+    }
+
+    /// Route Tab/Shift-Tab to [`TextInputEvent::Tab`]/[`BackTab`] instead of moving
+    /// focus, letting the owner drive navigation (e.g. advance to the next grid
+    /// cell). Off by default, so ordinary form fields keep normal Tab traversal.
+    pub fn emit_tab(mut self) -> Self {
+        self.emit_tab = true;
+        self
+    }
+
+    /// Route Up/Down to [`TextInputEvent::Up`]/[`Down`] so the owner can move a
+    /// selection in an attached list (e.g. an in-cell suggestion dropdown). Off by
+    /// default, so ordinary fields let Up/Down propagate to ancestors unchanged.
+    pub fn emit_nav(mut self) -> Self {
+        self.emit_nav = true;
         self
     }
 
@@ -252,6 +294,10 @@ impl TextInput {
             // Surfaced to the owner as `TextInputEvent`.
             KeyBinding::new("enter", Submit, ctx),
             KeyBinding::new("escape", Cancel, ctx),
+            // Up/Down are bound in a *separate* context that only `emit_nav` fields
+            // carry, so ordinary inputs still let these arrows propagate to ancestors.
+            KeyBinding::new("up", Up, Some("TextInputNav")),
+            KeyBinding::new("down", Down, Some("TextInputNav")),
         ]);
 
         // Clipboard, word-nav and line-nav modifiers differ by platform: macOS
@@ -393,11 +439,27 @@ impl TextInput {
     }
 
     fn focus_next(&mut self, _: &FocusNext, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus_next(cx);
+        if self.emit_tab {
+            cx.emit(TextInputEvent::Tab);
+        } else {
+            window.focus_next(cx);
+        }
     }
 
     fn focus_prev(&mut self, _: &FocusPrev, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus_prev(cx);
+        if self.emit_tab {
+            cx.emit(TextInputEvent::BackTab);
+        } else {
+            window.focus_prev(cx);
+        }
+    }
+
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TextInputEvent::Up);
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TextInputEvent::Down);
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
@@ -1116,7 +1178,13 @@ impl Render for TextInput {
         let a11y_id = ElementId::from(&self.focus_handle);
         let placeholder = self.placeholder.clone();
         let mut field = field
-            .key_context("TextInput")
+            // A nav-enabled field adds a second context so only it binds Up/Down
+            // (see `bind_keys`); ordinary fields stay plain `TextInput`.
+            .key_context(if self.emit_nav {
+                "TextInput TextInputNav"
+            } else {
+                "TextInput"
+            })
             .id(a11y_id)
             .role(Role::TextInput)
             .when(!placeholder.is_empty(), |this| this.aria_label(placeholder))
@@ -1143,6 +1211,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::show_character_palette))

@@ -169,8 +169,9 @@ impl Tree {
         self
     }
 
-    /// Disclosure toggle — fired (in addition to [`on_select`](Self::on_select))
-    /// on a single click of a row with children.
+    /// Disclosure toggle — fired on a single click of the row's chevron. The
+    /// chevron is its own hit target, so toggling never also fires
+    /// [`on_select`](Self::on_select); a body click reaches `on_select` instead.
     pub fn on_toggle(mut self, handler: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
         self.on_toggle = Some(Rc::new(handler));
         self
@@ -253,7 +254,14 @@ impl RenderOnce for Tree {
                     None
                 };
                 let glyph_disclosure = item.has_children && disclosure.is_none();
+                // The chevron is its own click target: clicking it toggles the row
+                // (and stops there), so the row body is free to carry a distinct
+                // action — select, or the caller's activate — without also
+                // expanding. Leaf rows draw an inert spacer for alignment.
+                let toggle_for_chevron = on_toggle.clone();
+                let chevron_clickable = item.has_children && toggle_for_chevron.is_some();
                 let chevron = div()
+                    .id(("tree-chevron", ix))
                     .w(px(16.))
                     .flex_shrink_0()
                     .flex()
@@ -264,13 +272,20 @@ impl RenderOnce for Tree {
                     .when(glyph_disclosure, |d| {
                         d.text_size(glyph_size)
                             .child(if item.expanded { "▼" } else { "▶" })
+                    })
+                    .when(chevron_clickable, |d| {
+                        d.cursor_pointer().on_click(move |_event, window, cx| {
+                            if let Some(on_toggle) = toggle_for_chevron.as_ref() {
+                                on_toggle(ix, window, cx);
+                            }
+                            // Don't let the toggle also select/activate the row.
+                            cx.stop_propagation();
+                        })
                     });
 
                 let on_select = on_select.clone();
-                let on_toggle = on_toggle.clone();
                 let on_activate = on_activate.clone();
                 let on_secondary = on_secondary.clone();
-                let has_children = item.has_children;
                 let clickable = on_select.is_some() || on_toggle.is_some() || on_activate.is_some();
 
                 out.push(
@@ -297,6 +312,9 @@ impl RenderOnce for Tree {
                         .when(!is_selected, |d| d.hover(move |s| s.bg(bg_hover)))
                         .when(clickable, |d| d.cursor_pointer())
                         .when(clickable, |d| {
+                            // A body click selects (or activates on double-click).
+                            // Expansion is handled by the chevron's own click above,
+                            // so the caller can open a leaf action on a single click.
                             d.on_click(move |event, window, cx| {
                                 if event.click_count() >= 2 {
                                     if let Some(on_activate) = on_activate.as_ref() {
@@ -306,11 +324,6 @@ impl RenderOnce for Tree {
                                 }
                                 if let Some(on_select) = on_select.as_ref() {
                                     on_select(ix, event, window, cx);
-                                }
-                                if has_children {
-                                    if let Some(on_toggle) = on_toggle.as_ref() {
-                                        on_toggle(ix, window, cx);
-                                    }
                                 }
                             })
                         })

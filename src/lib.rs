@@ -22,8 +22,10 @@ pub use gpui;
 
 pub use components::badge::{Badge, BadgeVariant};
 pub use components::button::{Button, ButtonSize, ButtonVariant};
+pub use components::checkbox::Checkbox;
 pub use components::code_editor::{
-    CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider, Highlighter,
+    CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider, Decoration,
+    DecorationProvider, DecorationStyle, GutterMarkerProvider, Highlighter, HoverProvider,
     RichCompletionProvider, TokenStyle,
 };
 pub use components::combo_box::{ComboBox, ComboBoxEvent};
@@ -38,7 +40,7 @@ pub use components::progress_bar::ProgressBar;
 pub use components::scrollbar::{Scrollbar, ScrollbarState};
 pub use components::segmented::Segmented;
 pub use components::select::Select;
-pub use components::selectable_label::SelectableLabel;
+pub use components::selectable_label::{SelectableLabel, SelectionGroup};
 pub use components::split_pane::{DragAnchor, SplitPane, SplitSide};
 pub use components::switcher::{
     Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,
@@ -58,9 +60,11 @@ pub use theme::{ActiveTheme, MotionPreference, ReduceMotion, Theme};
 pub mod prelude {
     pub use crate::components::badge::{Badge, BadgeVariant};
     pub use crate::components::button::{Button, ButtonSize, ButtonVariant};
+    pub use crate::components::checkbox::Checkbox;
     pub use crate::components::code_editor::{
         CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider,
-        Highlighter, RichCompletionProvider, TokenStyle,
+        Decoration, DecorationProvider, DecorationStyle, GutterMarkerProvider, Highlighter,
+        HoverProvider, RichCompletionProvider, TokenStyle,
     };
     pub use crate::components::combo_box::{ComboBox, ComboBoxEvent};
     pub use crate::components::context_menu::{ContextMenu, ContextMenuItem, Submenu};
@@ -76,7 +80,7 @@ pub mod prelude {
     pub use crate::components::scrollbar::{Scrollbar, ScrollbarState};
     pub use crate::components::segmented::Segmented;
     pub use crate::components::select::Select;
-    pub use crate::components::selectable_label::SelectableLabel;
+    pub use crate::components::selectable_label::{SelectableLabel, SelectionGroup};
     pub use crate::components::split_pane::{DragAnchor, SplitPane, SplitSide};
     pub use crate::components::switcher::{
         Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,

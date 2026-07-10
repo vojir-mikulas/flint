@@ -127,6 +127,44 @@ impl Gallery {
             CodeEditor::new(cx)
                 .with_content(SAMPLE_SQL)
                 .highlighter(sql::tokenize)
+                // Diagnostics seam demo: wavy-underline every occurrence of a
+                // stand-in "unknown" token. RED supplies real schema-resolved
+                // ranges (unknown table/column); the editor only draws them.
+                .decorations(|content| {
+                    let needle = "score";
+                    let mut out = Vec::new();
+                    let mut from = 0;
+                    while let Some(i) = content[from..].find(needle) {
+                        let s = from + i;
+                        out.push(Decoration {
+                            range: s..s + needle.len(),
+                            style: DecorationStyle::Error,
+                        });
+                        from = s + needle.len();
+                    }
+                    out
+                })
+                // Hover-peek seam demo: a canned tooltip for the demo tokens. RED
+                // resolves the offset to a real table/column against its schema.
+                .hover(|content, offset| {
+                    let word = content.get(offset..offset + 1)?;
+                    (!word.trim().is_empty())
+                        .then(|| SharedString::from("peek\n  hover resolves to schema here"))
+                })
+                // Gutter run-marker demo: a ▶ on each statement-leading line. RED
+                // uses its real statement splitter; a click emits RunLine.
+                .gutter_markers(|content| {
+                    let leads = ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "CREATE"];
+                    content
+                        .lines()
+                        .enumerate()
+                        .filter(|(_, l)| {
+                            let t = l.trim_start().to_ascii_uppercase();
+                            leads.iter().any(|k| t.starts_with(k))
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                })
         });
         // ⌘↵ in the editor emits Run; mirror it into the "last run" readout.
         cx.subscribe(&sql_editor, |this, editor, _event: &CodeEditorEvent, cx| {
@@ -670,6 +708,29 @@ impl Gallery {
             )
             .child(Toggle::new("tg-off", false))
             .child(Toggle::new("tg-disabled", true).disabled(true))
+    }
+
+    fn checkboxes(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        div()
+            .flex()
+            .gap_3()
+            .items_center()
+            .child(
+                Checkbox::new("cb", self.toggle_on).on_change(move |on, _window, cx| {
+                    let on = *on;
+                    view.update(cx, |this, cx| {
+                        this.toggle_on = on;
+                        cx.notify();
+                    });
+                }),
+            )
+            .child(Checkbox::new("cb-off", false))
+            // A caller-supplied mark overrides the default "✓" glyph (apps pass a
+            // masked line-icon SVG here; the gallery ships no assets, so a glyph).
+            .child(Checkbox::new("cb-mark", true).mark("➜"))
+            .child(Checkbox::new("cb-on-disabled", true).disabled(true))
+            .child(Checkbox::new("cb-off-disabled", false).disabled(true))
     }
 
     fn segmented(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1465,6 +1526,7 @@ impl Render for Gallery {
         let progress = self.progress(cx);
         let tabs = self.tabs(cx);
         let toggles = self.toggles(cx);
+        let checkboxes = self.checkboxes(cx);
         let segmented = self.segmented(cx);
         let select = self.select(cx);
         let number_input = self.number_input();
@@ -1495,6 +1557,7 @@ impl Render for Gallery {
             .child(self.section("Progress", progress, cx))
             .child(self.section("Tabs", tabs, cx))
             .child(self.section("Toggle", toggles, cx))
+            .child(self.section("Checkbox", checkboxes, cx))
             .child(self.section("Segmented", segmented, cx))
             .child(self.section("Select", select, cx))
             .child(self.section(

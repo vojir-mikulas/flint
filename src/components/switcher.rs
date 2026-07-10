@@ -197,6 +197,11 @@ impl Switcher {
             }
             TextInputEvent::Submit => this.activate(this.selected, cx),
             TextInputEvent::Cancel => this.dismiss(cx),
+            // This field doesn't opt into `emit_tab`/`emit_nav`, so these never fire.
+            TextInputEvent::Tab
+            | TextInputEvent::BackTab
+            | TextInputEvent::Up
+            | TextInputEvent::Down => {}
         })
         .detach();
 

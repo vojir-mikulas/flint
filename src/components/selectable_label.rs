@@ -14,23 +14,38 @@
 //! [`SelectableLabel::bind_keys`] once at startup. Text style (color, size,
 //! font) is inherited from the parent, like any text element.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     actions, div, fill, point, prelude::*, App, Bounds, ClipboardItem, Context, CursorStyle,
     Element, ElementId, Entity, FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, SharedString, StyledText, TextLayout, Window,
+    Pixels, Point, SharedString, StyledText, TextLayout, TextRun, Window,
 };
 
 use crate::theme::ActiveTheme;
 
 actions!(flint_selectable_label, [Copy, SelectAll]);
 
+/// Coordinates a single active selection across several [`SelectableLabel`]s (e.g. a
+/// chat transcript rendered as one label per Markdown block). The cell holds the id
+/// of the label that owns the live selection; when a label starts a new selection it
+/// stamps its own id here, and every other label clears itself on the next render.
+/// So the panel shows one highlight at a time instead of many independent ones.
+/// Cheap to clone (an `Rc`), one per group of labels.
+pub type SelectionGroup = Rc<Cell<u64>>;
+
 /// A read-only, wrapping text label whose text can be selected and copied.
 pub struct SelectableLabel {
     focus_handle: FocusHandle,
     text: SharedString,
+    /// Optional per-run styling (font/weight/color/background), for rendering
+    /// styled text (e.g. a chat message's inline Markdown) that stays selectable.
+    /// Empty means inherit the ambient text style like a plain label. The runs'
+    /// byte lengths must sum to `text.len()` (the `StyledText` invariant).
+    runs: Vec<TextRun>,
     /// Byte range of the current selection (empty = nothing selected), always
     /// normalized to `start <= end`. The drag anchor is tracked separately so an
     /// upward/leftward drag still produces a forward range.
@@ -38,6 +53,12 @@ pub struct SelectableLabel {
     /// The fixed end of an in-progress drag; the moving end follows the cursor.
     anchor: usize,
     selecting: bool,
+    /// Optional shared "who owns the live selection" cell, and this label's id within
+    /// it. When set, starting a selection stamps `group` with `group_id`, and any
+    /// render where `group != group_id` clears this label's selection — so a group of
+    /// labels shows a single selection at a time. `None` for a standalone label.
+    group: Option<SelectionGroup>,
+    group_id: u64,
     /// Captured each paint so the next mouse event can hit-test against the same
     /// geometry. Shares its `Rc` cell with the inner `StyledText`, so it stays
     /// live between frames.
@@ -49,11 +70,31 @@ impl SelectableLabel {
         Self {
             focus_handle: cx.focus_handle(),
             text: text.into(),
+            runs: Vec::new(),
             selection: 0..0,
             anchor: 0,
             selecting: false,
+            group: None,
+            group_id: 0,
             layout: None,
         }
+    }
+
+    /// Join this label to a [`SelectionGroup`] under the id `id`, so only one label in
+    /// the group holds a selection at a time (the others clear when a new selection
+    /// starts). Ids must be unique within a group.
+    pub fn selection_group(mut self, group: SelectionGroup, id: u64) -> Self {
+        self.group = Some(group);
+        self.group_id = id;
+        self
+    }
+
+    /// Give the label styled runs (font/weight/color/background per span), so
+    /// styled text stays selectable. The runs' byte lengths must sum to the text
+    /// length; a mismatch renders as plain text (the `StyledText` fallback).
+    pub fn with_runs(mut self, runs: Vec<TextRun>) -> Self {
+        self.runs = runs;
+        self
     }
 
     pub fn text(&self) -> SharedString {
@@ -63,6 +104,9 @@ impl SelectableLabel {
     /// Replace the text, clearing any selection.
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.text = text.into();
+        // Drop any styled runs: they were sized for the old text, so keeping them
+        // would violate the `StyledText` length invariant.
+        self.runs.clear();
         self.selection = 0..0;
         self.anchor = 0;
         self.layout = None;
@@ -108,11 +152,27 @@ impl SelectableLabel {
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // Take ownership of the group's live selection so the siblings clear.
+        if let Some(group) = &self.group {
+            group.set(self.group_id);
+        }
         let ix = self.index_for(event.position);
         self.anchor = ix;
         self.selection = ix..ix;
         self.selecting = true;
         cx.notify();
+    }
+
+    /// If this label is in a group and no longer owns the live selection, drop its
+    /// highlight — another label started one. Called at the top of `render`.
+    fn sync_group(&mut self) {
+        if let Some(group) = &self.group {
+            if group.get() != self.group_id && !self.selection.is_empty() {
+                self.selection = 0..0;
+                self.anchor = 0;
+                self.selecting = false;
+            }
+        }
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -137,6 +197,8 @@ impl Focusable for SelectableLabel {
 
 impl Render for SelectableLabel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Drop a stale highlight if another label in the group took over.
+        self.sync_group();
         // The focus handle doubles as a stable a11y id. Clicking the element
         // focuses the tracked handle (GPUI does this for focusable interactive
         // elements), so the `SelectableLabel`-context copy binding routes here.
@@ -191,8 +253,14 @@ impl Element for SelectionElement {
         cx: &mut App,
     ) -> (LayoutId, StyledText) {
         // `StyledText` ignores the element/inspector ids, so passing `None` is
-        // sound; it inherits the ambient text style for color/size/font.
-        let mut text = StyledText::new(self.view.read(cx).text.clone());
+        // sound; it inherits the ambient text style for color/size/font. When the
+        // label carries styled runs (e.g. inline Markdown), apply them; a run-length
+        // mismatch makes `StyledText` fall back to the ambient style.
+        let view = self.view.read(cx);
+        let mut text = StyledText::new(view.text.clone());
+        if !view.runs.is_empty() {
+            text = text.with_runs(view.runs.clone());
+        }
         let (layout_id, ()) = text.request_layout(None, None, window, cx);
         (layout_id, text)
     }

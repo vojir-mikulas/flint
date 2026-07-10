@@ -66,7 +66,12 @@ impl NumberInput {
                     let value = this.value;
                     this.set_value(value, cx);
                 }
-                TextInputEvent::Change => {}
+                // This field doesn't opt into `emit_tab`/`emit_nav`, so these never fire.
+                TextInputEvent::Change
+                | TextInputEvent::Tab
+                | TextInputEvent::BackTab
+                | TextInputEvent::Up
+                | TextInputEvent::Down => {}
             });
 
         Self {

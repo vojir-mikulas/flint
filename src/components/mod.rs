@@ -7,6 +7,7 @@
 
 pub mod badge;
 pub mod button;
+pub mod checkbox;
 pub mod code_editor;
 pub mod combo_box;
 pub mod context_menu;

@@ -114,6 +114,11 @@ impl Palette {
                 }
             }
             TextInputEvent::Cancel => cx.emit(PaletteEvent::Dismiss),
+            // This field doesn't opt into `emit_tab`/`emit_nav`, so these never fire.
+            TextInputEvent::Tab
+            | TextInputEvent::BackTab
+            | TextInputEvent::Up
+            | TextInputEvent::Down => {}
         })
         .detach();
 
