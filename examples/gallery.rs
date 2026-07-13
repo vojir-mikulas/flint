@@ -294,6 +294,23 @@ impl Gallery {
                 "Victor Mono",
             ];
             c.set_options(fonts.iter().map(|s| (*s).into()).collect(), Some(6), cx);
+            // Full-width trigger + a per-option colour dot (keyed by option index),
+            // exercising `set_full_width` / `set_leading` — the same slot RED uses
+            // for engine tint dots in its connection form.
+            c.set_full_width(true, cx);
+            c.set_leading(
+                |ix, app| {
+                    let t = app.theme();
+                    let palette = [t.blue, t.green, t.yellow, t.red, t.purple, t.cyan];
+                    div()
+                        .size(px(8.))
+                        .rounded_full()
+                        .flex_none()
+                        .bg(palette[ix % palette.len()])
+                        .into_any_element()
+                },
+                cx,
+            );
             c
         });
         cx.subscribe(&combo, |this, _, event: &ComboBoxEvent, cx| {

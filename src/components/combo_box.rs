@@ -32,6 +32,13 @@ actions!(flint_combo_box, [SelectNext, SelectPrev]);
 /// domain-free — RED hands in its lucide SVGs, the gallery a unicode mark.
 type IconFn = Box<dyn Fn(&App) -> AnyElement + 'static>;
 
+/// A per-option leading-element factory, keyed by the option's index in the list
+/// last handed to [`ComboBox::set_options`]. Re-invoked each render so it
+/// re-themes with the app. Drawn before the label in the trigger (for the current
+/// selection) and on every popover row — e.g. a colour swatch or engine glyph.
+/// Domain-free: the combo passes only the index, the caller decides what to draw.
+type LeadingFn = Box<dyn Fn(usize, &App) -> AnyElement + 'static>;
+
 /// What the owner subscribes to via `cx.subscribe`.
 #[derive(Clone, Debug)]
 pub enum ComboBoxEvent {
@@ -69,6 +76,12 @@ pub struct ComboBox {
     chevron: Option<IconFn>,
     /// Mark on the selected row; falls back to a unicode check.
     check: Option<IconFn>,
+    /// Optional leading element per option (colour dot, glyph). Keyed by option
+    /// index; drawn in the trigger and on each row. `None` = label only.
+    leading: Option<LeadingFn>,
+    /// Stretch the trigger to fill its parent's width. Default `false` (the
+    /// trigger sizes to its content, like a menu button).
+    full_width: bool,
 }
 
 impl ComboBox {
@@ -111,6 +124,8 @@ impl ComboBox {
             placeholder: "Select…".into(),
             chevron: None,
             check: None,
+            leading: None,
+            full_width: false,
         }
     }
 
@@ -173,6 +188,27 @@ impl ComboBox {
         cx: &mut Context<Self>,
     ) {
         self.check = Some(Box::new(make));
+        cx.notify();
+    }
+
+    /// A leading element drawn before each option's label — in the trigger for the
+    /// current selection and on every popover row. The factory is keyed by the
+    /// option's index (its position in the list passed to [`set_options`]) and
+    /// re-invoked each render so it re-themes. Unset = label only.
+    pub fn set_leading(
+        &mut self,
+        make: impl Fn(usize, &App) -> AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.leading = Some(Box::new(make));
+        cx.notify();
+    }
+
+    /// Whether the trigger stretches to fill its parent's width. Off by default
+    /// (the trigger sizes to content); on for form fields that line up with
+    /// full-width inputs above and below them.
+    pub fn set_full_width(&mut self, full: bool, cx: &mut Context<Self>) {
+        self.full_width = full;
         cx.notify();
     }
 
@@ -324,6 +360,10 @@ impl Render for ComboBox {
                 .child("⌄")
                 .into_any_element(),
         };
+        // The current selection's leading element (colour dot / glyph), if any.
+        let trigger_leading = self
+            .current
+            .and_then(|ix| self.leading.as_ref().map(|make| make(ix, cx)));
         let trigger = div()
             .id(self.id.clone())
             .role(Role::ComboBox)
@@ -333,6 +373,7 @@ impl Render for ComboBox {
             .items_center()
             .gap_1p5()
             .h(px(24.))
+            .when(self.full_width, |t| t.w_full())
             .px_2()
             .rounded(theme.radius)
             .bg(theme.bg_input)
@@ -357,7 +398,8 @@ impl Render for ComboBox {
             // owns the handle and the search field holds focus.
             .when(!open, |this| this.track_focus(&self.focus_handle))
             .focus(|s| s.border_color(theme.accent))
-            .child(div().child(current_label))
+            .when_some(trigger_leading, |t, el| t.child(el))
+            .child(div().flex_1().min_w_0().child(current_label))
             .child(chevron)
             .child(
                 // Invisible overlay recording the trigger's window bounds so the
@@ -407,6 +449,14 @@ impl Render for ComboBox {
                     .into_any_element(),
             });
 
+        // Leading element per visible row, built up front (they borrow `cx`); moved
+        // into the rows below by index. Empty when no leading factory is set.
+        let mut row_leadings: Vec<Option<AnyElement>> = self
+            .filtered
+            .iter()
+            .map(|f| self.leading.as_ref().map(|make| make(f.option, cx)))
+            .collect();
+
         let rows: Vec<_> = self
             .filtered
             .iter()
@@ -416,6 +466,7 @@ impl Render for ComboBox {
                 let is_current = Some(f.option) == current;
                 let view = view.clone();
                 let check = is_current.then(|| active_check.take()).flatten();
+                let leading = row_leadings[row_ix].take();
                 div()
                     .id(("combo-row", row_ix))
                     .role(Role::ListBoxOption)
@@ -430,6 +481,7 @@ impl Render for ComboBox {
                     .cursor_pointer()
                     .when(is_cursor, |d| d.bg(bg_selected))
                     .when(!is_cursor, |d| d.hover(move |s| s.bg(bg_hover)))
+                    .when_some(leading, |d, el| d.child(el))
                     .child(div().flex_1().min_w_0().child(highlighted_label(
                         &self.options[f.option],
                         &f.positions,

@@ -5,13 +5,15 @@
 //! declares [`Column`]s + a row renderer and owns selection/sort, which the table
 //! renders and reports clicks against.
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
     canvas, div, point, prelude::*, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
     ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, Pixels, Point, Role, ScrollHandle,
-    ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window,
+    ScrollWheelEvent, SharedString, Styled, TouchPhase, UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -136,6 +138,30 @@ impl Column {
         self.sortable = true;
         self
     }
+}
+
+thread_local! {
+    /// Per-table sticky scroll-axis lock, keyed by table id. A trackpad swipe
+    /// near the diagonal produces mixed x/y deltas tick to tick; deciding the
+    /// dominant axis fresh on every tick makes the grid flip-flop between
+    /// vertical and horizontal (reads as diagonal drift even though each single
+    /// tick is axis-locked). Latching the decision for the lifetime of one
+    /// gesture — reset on [`TouchPhase::Started`] — fixes it. Lives in a
+    /// thread-local rather than on [`Table`] itself since the table is a
+    /// stateless `RenderOnce` rebuilt every frame; GPUI's UI runs on one thread,
+    /// so this never needs to be `Send`.
+    static AXIS_LOCKS: std::cell::RefCell<HashMap<SharedString, Rc<Cell<Option<bool>>>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+fn axis_lock_for(id: &SharedString) -> Rc<Cell<Option<bool>>> {
+    AXIS_LOCKS.with(|locks| {
+        locks
+            .borrow_mut()
+            .entry(id.clone())
+            .or_insert_with(|| Rc::new(Cell::new(None)))
+            .clone()
+    })
 }
 
 fn cell_layout<E: Styled>(el: E, column: &Column, align: ColumnAlign) -> E {
@@ -958,6 +984,7 @@ impl<D: 'static> RenderOnce for Table<D> {
             // Keep a pure-vertical wheel from being redirected into x-scroll.
             hscroll.style().restrict_scroll_to_axis = Some(true);
 
+            let table_id = self.id.clone();
             let mut root = div()
                 .id(self.id)
                 .role(Role::Grid)
@@ -976,18 +1003,27 @@ impl<D: 'static> RenderOnce for Table<D> {
             // can't drift diagonally.
             if let (Some(h), Some(v)) = (self.h_scroll_handle.clone(), self.scroll_handle.clone()) {
                 let v = v.0.borrow().base_handle.clone();
+                let axis_lock = axis_lock_for(&table_id);
                 root = root.relative().child(
                     canvas(
                         |_, _, _| (),
                         move |bounds: Bounds<Pixels>, _, window, _| {
                             let view = window.current_view();
                             let line_height = window.line_height();
+                            let axis_lock = axis_lock.clone();
                             window.on_mouse_event(
                                 move |event: &ScrollWheelEvent, phase, _window, cx| {
                                     if phase != DispatchPhase::Capture
                                         || !bounds.contains(&event.position)
                                     {
                                         return;
+                                    }
+                                    // A new gesture (trackpad finger down, or a
+                                    // fresh wheel notch) starts undecided, so a
+                                    // stale lock from a previous swipe never
+                                    // leaks into this one.
+                                    if matches!(event.touch_phase, TouchPhase::Started) {
+                                        axis_lock.set(None);
                                     }
                                     let delta = event.delta.pixel_delta(line_height);
                                     let (ax, ay) = (delta.x.abs(), delta.y.abs());
@@ -996,12 +1032,18 @@ impl<D: 'static> RenderOnce for Table<D> {
                                     if ax.is_zero() || ay.is_zero() {
                                         return;
                                     }
-                                    // Any mixed-axis wheel locks to whichever axis
-                                    // dominates and swallows the event, so a swipe
-                                    // only ever moves one axis — no diagonal drift.
-                                    // A tie breaks toward vertical (the common
-                                    // reading direction).
-                                    if ax > ay {
+                                    // A mixed-axis tick swallows the event and
+                                    // moves whichever axis this *gesture* has
+                                    // locked to. The first ambiguous tick decides
+                                    // (dominant axis wins, ties toward vertical)
+                                    // and every later tick in the same gesture
+                                    // sticks to it — deciding fresh every tick
+                                    // instead would flip-flop near a 45° swipe
+                                    // and read as diagonal drift.
+                                    let mut locked = axis_lock.get();
+                                    let horizontal = *locked.get_or_insert(ax > ay);
+                                    axis_lock.set(locked);
+                                    if horizontal {
                                         h.set_offset(h.offset() + point(delta.x, gpui::px(0.)));
                                     } else {
                                         v.set_offset(v.offset() + point(gpui::px(0.), delta.y));
