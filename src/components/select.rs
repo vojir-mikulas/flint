@@ -28,6 +28,7 @@ pub struct Select {
     selected: usize,
     open: bool,
     accent: bool,
+    seamless: bool,
     placeholder: SharedString,
     chevron: Option<AnyElement>,
     check: Option<AnyElement>,
@@ -43,6 +44,7 @@ impl Select {
             selected: 0,
             open: false,
             accent: true,
+            seamless: false,
             placeholder: "Select…".into(),
             chevron: None,
             check: None,
@@ -71,6 +73,15 @@ impl Select {
     /// toolbars where an accent-colored value would over-emphasize the control.
     pub fn accent(mut self, accent: bool) -> Self {
         self.accent = accent;
+        self
+    }
+
+    /// Drop the trigger's own border, background and rounded box so it blends
+    /// into a parent-styled container (e.g. a leading mode-picker glued inside a
+    /// combined search field). The label + disclosure and the anchored option
+    /// list are unchanged; only the resting chrome is removed.
+    pub fn seamless(mut self) -> Self {
+        self.seamless = true;
         self
     }
 
@@ -111,6 +122,7 @@ impl RenderOnce for Select {
         let open = self.open;
         let selected = self.selected;
         let accent = self.accent;
+        let seamless = self.seamless;
         // The value/selection hue: accent for the native popup look, else neutral.
         let value_color = if accent { theme.accent } else { theme.text };
 
@@ -177,13 +189,18 @@ impl RenderOnce for Select {
             // toolbar; the label truncates rather than overflowing its row.
             .min_w(px(0.))
             .px_2()
-            .rounded(theme.radius)
-            .bg(theme.bg_input)
-            .border_1()
-            .border_color(if open {
-                theme.border_strong
-            } else {
-                theme.border
+            // In `seamless` mode the trigger draws no box of its own — the parent
+            // container owns the border/background — so only the bordered variant
+            // paints the resting chrome.
+            .when(!seamless, |s| {
+                s.rounded(theme.radius)
+                    .bg(theme.bg_input)
+                    .border_1()
+                    .border_color(if open {
+                        theme.border_strong
+                    } else {
+                        theme.border
+                    })
             })
             .text_size(theme.font_size)
             .font_weight(FontWeight::MEDIUM)
