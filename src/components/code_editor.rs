@@ -169,6 +169,13 @@ pub type HoverProvider = Rc<dyn Fn(&str, usize) -> Option<SharedString>>;
 /// [`CodeEditorEvent::RunLine`]. Re-run each render. Domain-free.
 pub type GutterMarkerProvider = Rc<dyn Fn(&str) -> Vec<usize>>;
 
+/// Optional companion to [`GutterMarkerProvider`]: builds the glyph drawn for each
+/// run marker (e.g. a caller-supplied play icon). The editor wraps it in the
+/// clickable, hover-tinted cell and falls back to a `▶` text glyph when unset. The
+/// element should tint to `currentColor` so the marker's hover recolour lands on
+/// it. Domain-free — flint ships no icons; the caller hands in its own glyph/SVG.
+pub type GutterMarkerIcon = Rc<dyn Fn() -> gpui::AnyElement>;
+
 /// The completion seam: given the full text and the cursor's byte offset, return
 /// candidate completions for the word ending at the cursor. The editor replaces
 /// that word with the accepted candidate. Domain-free — RED supplies schema +
@@ -338,6 +345,8 @@ pub struct CodeEditor {
     hover_provider: Option<HoverProvider>,
     /// Flags gutter lines that get a run marker (▶); a click emits `RunLine`.
     gutter_marker_provider: Option<GutterMarkerProvider>,
+    /// Builds the glyph shown for each gutter run marker; falls back to `▶`.
+    gutter_marker_icon: Option<GutterMarkerIcon>,
     /// The byte offset under the pointer, tracked while a [`hover_provider`] is set
     /// so the tooltip follows the mouse. Cleared when the pointer leaves.
     hovered: Option<usize>,
@@ -404,6 +413,7 @@ impl CodeEditor {
             hover_provider: None,
             hovered: None,
             gutter_marker_provider: None,
+            gutter_marker_icon: None,
             completion_provider: None,
             rich_provider: None,
             completion_detail: None,
@@ -535,6 +545,15 @@ impl CodeEditor {
     /// [`CodeEditorEvent::RunLine`]. Recomputed each render, so markers track edits.
     pub fn gutter_markers(mut self, f: impl Fn(&str) -> Vec<usize> + 'static) -> Self {
         self.gutter_marker_provider = Some(Rc::new(f));
+        self
+    }
+
+    /// Supply the element drawn for each gutter run marker (see
+    /// [`GutterMarkerIcon`]) — e.g. a lucide play icon — in place of the default
+    /// `▶` glyph. The element should tint to `currentColor` so the marker keeps
+    /// its hover recolour.
+    pub fn gutter_marker_icon(mut self, f: impl Fn() -> gpui::AnyElement + 'static) -> Self {
+        self.gutter_marker_icon = Some(Rc::new(f));
         self
     }
 
@@ -2126,6 +2145,8 @@ impl Render for CodeEditor {
             .map(|p| p(&self.content).into_iter().collect())
             .unwrap_or_default();
         let accent = theme.accent;
+        // Optional caller-supplied marker glyph (e.g. a play icon); `▶` otherwise.
+        let marker_icon = self.gutter_marker_icon.clone();
 
         // Line-number gutter (plain divs; scrolls with the code as a flex sibling).
         // A marker line leads with a clickable ▶ that emits `RunLine`; other lines
@@ -2150,15 +2171,19 @@ impl Render for CodeEditor {
                         .child(
                             div()
                                 .id(("run-line", n))
-                                .w(px(11.))
+                                .w(px(13.))
                                 .flex_none()
                                 .flex()
                                 .items_center()
+                                .justify_center()
                                 .when(is_marker, |d| {
                                     d.cursor(CursorStyle::PointingHand)
                                         .text_color(gutter_fg)
                                         .hover(|s| s.text_color(accent))
-                                        .child("▶")
+                                        .child(match &marker_icon {
+                                            Some(make) => make(),
+                                            None => "▶".into_any_element(),
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |_this, _, _, cx| {
