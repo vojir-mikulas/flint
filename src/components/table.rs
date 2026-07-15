@@ -272,6 +272,11 @@ pub struct Table<D: 'static = ()> {
     on_cell_secondary: Option<CellSecondaryHandler>,
     focus_handle: Option<FocusHandle>,
     on_nav: Option<NavHandler>,
+    /// When set, the focusable cell cursor also accepts vim-style motion keys
+    /// (`hjkl`, `g`/`G`, `0`/`$`, `Ctrl-d`/`Ctrl-u`) as aliases for the arrow /
+    /// Home/End / Page navigation. Off by default so the keys stay inert for
+    /// callers that don't opt in.
+    vim_nav: bool,
     horizontal: bool,
     /// Font family for the header + cells (e.g. a monospace data grid). `None`
     /// inherits the ambient family.
@@ -325,6 +330,7 @@ impl<D: 'static> Table<D> {
             on_cell_secondary: None,
             focus_handle: None,
             on_nav: None,
+            vim_nav: false,
             horizontal: false,
             font_family: None,
             text_size: None,
@@ -414,6 +420,14 @@ impl<D: 'static> Table<D> {
         handler: impl Fn(TableNav, bool, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_nav = Some(Rc::new(handler));
+        self
+    }
+
+    /// Also accept vim-style motion keys (`hjkl`, `g`/`G`, `0`/`$`, `Ctrl-d`/
+    /// `Ctrl-u`) on the focusable cell cursor, as aliases for the arrow / Home /
+    /// End / Page navigation. Off by default; a caller opts in per its own toggle.
+    pub fn vim_nav(mut self, vim_nav: bool) -> Self {
+        self.vim_nav = vim_nav;
         self
     }
 
@@ -605,12 +619,15 @@ impl<D: 'static> Table<D> {
 
 /// The cell-cursor key handler installed when a table is focusable: arrows,
 /// Home/End, PageUp/Down, and ⌘-arrows map to a [`TableNav`] (Shift extends).
+/// When `vim` is set, vim motion keys are accepted as aliases too.
 fn table_key_nav(
     on_nav: NavHandler,
+    vim: bool,
 ) -> impl Fn(&gpui::KeyDownEvent, &mut Window, &mut App) + 'static {
     move |event, window, cx| {
         let ks = &event.keystroke;
         let cmd = ks.modifiers.secondary();
+        let ctrl = ks.modifiers.control;
         let nav = match ks.key.as_str() {
             "up" if cmd => TableNav::First,
             "down" if cmd => TableNav::Last,
@@ -624,6 +641,19 @@ fn table_key_nav(
             "end" => TableNav::RowEnd,
             "pageup" => TableNav::PageUp,
             "pagedown" => TableNav::PageDown,
+            // Vim motions (opt-in), mapped onto the same intents. `g`/`G` are
+            // top/bottom, `0`/`$` row ends, `Ctrl-d`/`Ctrl-u` half-page (approximated
+            // by a full page since the intent set has no half-page variant).
+            "h" if vim && !cmd => TableNav::Left,
+            "j" if vim && !cmd => TableNav::Down,
+            "k" if vim && !cmd => TableNav::Up,
+            "l" if vim && !cmd => TableNav::Right,
+            "g" if vim && !cmd => TableNav::First,
+            "G" if vim => TableNav::Last,
+            "0" if vim => TableNav::RowStart,
+            "$" if vim => TableNav::RowEnd,
+            "d" if vim && ctrl => TableNav::PageDown,
+            "u" if vim && ctrl => TableNav::PageUp,
             _ => return,
         };
         cx.stop_propagation();
@@ -742,6 +772,7 @@ impl<D: 'static> RenderOnce for Table<D> {
         let on_cell_secondary = self.on_cell_secondary.clone();
         let focus_handle = self.focus_handle.clone();
         let on_nav = self.on_nav.clone();
+        let vim_nav = self.vim_nav;
         let a11y_label = self.a11y_label.clone();
 
         let list = uniform_list("table-rows", row_count, move |range, window, cx| {
@@ -1063,7 +1094,7 @@ impl<D: 'static> RenderOnce for Table<D> {
             root.when_some(focus_handle.clone(), |d, handle| {
                 let d = d.track_focus(&handle).key_context("Table");
                 match on_nav.clone() {
-                    Some(on_nav) => d.on_key_down(table_key_nav(on_nav)),
+                    Some(on_nav) => d.on_key_down(table_key_nav(on_nav, vim_nav)),
                     None => d,
                 }
             })
@@ -1080,7 +1111,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                 .when_some(focus_handle.clone(), |d, handle| {
                     let d = d.track_focus(&handle).key_context("Table");
                     match on_nav.clone() {
-                        Some(on_nav) => d.on_key_down(table_key_nav(on_nav)),
+                        Some(on_nav) => d.on_key_down(table_key_nav(on_nav, vim_nav)),
                         None => d,
                     }
                 })

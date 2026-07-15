@@ -88,6 +88,9 @@ pub struct Tree {
     focus_handle: Option<FocusHandle>,
     on_nav: Option<NavHandler>,
     on_secondary: Option<SecondaryHandler>,
+    /// When set, the focusable tree also accepts vim motion keys (`hjkl`, `g`/`G`)
+    /// as aliases for the arrow-key navigation. Off by default.
+    vim_nav: bool,
 }
 
 impl Tree {
@@ -107,7 +110,15 @@ impl Tree {
             focus_handle: None,
             on_nav: None,
             on_secondary: None,
+            vim_nav: false,
         }
+    }
+
+    /// Accept vim motion keys (`h` collapse, `l` expand, `j`/`k` down/up, `g`/`G`
+    /// top/bottom) on the focusable tree, alongside the arrow keys. Off by default.
+    pub fn vim_nav(mut self, vim_nav: bool) -> Self {
+        self.vim_nav = vim_nav;
+        self
     }
 
     /// The currently-visible rows, in display order (caller-flattened).
@@ -351,6 +362,7 @@ impl RenderOnce for Tree {
         };
 
         let on_nav = self.on_nav.clone();
+        let vim = self.vim_nav;
         div()
             .id(self.id)
             .flex()
@@ -367,6 +379,11 @@ impl RenderOnce for Tree {
                             "left" => TreeNav::Collapse,
                             "right" => TreeNav::Expand,
                             "enter" => TreeNav::Activate,
+                            // Vim motions (opt-in): h collapse, l expand, j/k down/up.
+                            "k" if vim => TreeNav::Up,
+                            "j" if vim => TreeNav::Down,
+                            "h" if vim => TreeNav::Collapse,
+                            "l" if vim => TreeNav::Expand,
                             _ => return,
                         };
                         cx.stop_propagation();
