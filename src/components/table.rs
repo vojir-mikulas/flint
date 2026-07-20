@@ -703,8 +703,13 @@ impl<D: 'static> RenderOnce for Table<D> {
                 .gap_1()
                 .h_full()
                 .px_2p5()
+                // Clip like the body cells (see the `overflow_hidden` below), so a
+                // title wider than a fixed-width column ellipsizes instead of
+                // bleeding into the next header cell. `min_w_0` lets the title
+                // shrink first, keeping the subtitle and sort caret visible.
+                .overflow_hidden()
                 .text_color(color)
-                .child(column.title.clone())
+                .child(div().min_w_0().truncate().child(column.title.clone()))
                 .when_some(column.subtitle.clone(), |this, sub| {
                     this.child(
                         div()
