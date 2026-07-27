@@ -20,6 +20,7 @@ pub mod number_input;
 pub mod palette;
 pub mod progress_bar;
 pub mod scrollbar;
+pub mod search_field;
 pub mod segmented;
 pub mod select;
 pub mod selectable_label;

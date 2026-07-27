@@ -280,6 +280,14 @@ pub enum CodeEditorEvent {
     /// The owner runs the statement starting there. Only lines the gutter-marker
     /// provider flagged carry a marker.
     RunLine(usize),
+    /// Up arrow on the first line, when the editor opted in via
+    /// [`CodeEditor::emit_nav`] and no completion popup is open. The owner moves a
+    /// selection in an attached list, or recalls history. Editors that don't opt in
+    /// never emit this.
+    Up,
+    /// Down arrow on the last line, under the same [`CodeEditor::emit_nav`] opt-in
+    /// as [`Up`](Self::Up).
+    Down,
 }
 
 /// An open completion popup: the word being completed starts at `start` (replaced
@@ -323,6 +331,10 @@ pub struct CodeEditor {
     /// bare Enter (no completion popup) emits [`CodeEditorEvent::Submit`] and
     /// Shift+Enter inserts a newline — the chat-composer convention.
     submit_on_enter: bool,
+    /// Whether an arrow with nowhere left to go surfaces to the owner as
+    /// [`CodeEditorEvent::Up`]/[`Down`](CodeEditorEvent::Down) (default `false`).
+    /// See [`Self::emit_nav`].
+    emit_nav: bool,
     /// Soft-wrap long lines to the editor width instead of scrolling horizontally
     /// (default `false`). For a prose surface like a chat composer. Off keeps the
     /// code-editor behaviour (one shaped line per logical line, horizontal scroll).
@@ -404,6 +416,7 @@ impl CodeEditor {
             placeholder: SharedString::default(),
             gutter: true,
             submit_on_enter: false,
+            emit_nav: false,
             soft_wrap: false,
             desired_col: None,
             corner_radius: None,
@@ -483,6 +496,20 @@ impl CodeEditor {
     /// for a code surface, where Enter always inserts a line.
     pub fn submit_on_enter(mut self, submit: bool) -> Self {
         self.submit_on_enter = submit;
+        self
+    }
+
+    /// Surface an arrow that has nowhere left to go in the buffer to the owner as
+    /// [`CodeEditorEvent::Up`]/[`Down`](CodeEditorEvent::Down), so it can drive an
+    /// attached list or history recall — the `TextInput::emit_nav` contract, for an
+    /// editor. Default off, so an ordinary code surface is untouched.
+    ///
+    /// Only fires *at the edge*: Up on the first line, Down on the last. Vertical
+    /// motion inside a multi-line buffer still moves the cursor, and a completion
+    /// popup always wins (there the arrows move the highlight). A one-line editor —
+    /// a filter or search box — is all edge, so it hands over every arrow.
+    pub fn emit_nav(mut self, emit: bool) -> Self {
+        self.emit_nav = emit;
         self
     }
 
@@ -993,6 +1020,9 @@ impl CodeEditor {
             self.completion_move(-1, cx);
             return;
         }
+        if self.nav_at_edge(true, cx) {
+            return;
+        }
         self.vertical(true, false, cx);
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
@@ -1000,7 +1030,33 @@ impl CodeEditor {
             self.completion_move(1, cx);
             return;
         }
+        if self.nav_at_edge(false, cx) {
+            return;
+        }
         self.vertical(false, false, cx);
+    }
+
+    /// With [`emit_nav`](Self::emit_nav) on, hand an arrow that can't move any
+    /// further to the owner instead of letting it do nothing. Returns whether the
+    /// arrow was handed over (and so must not also move the cursor).
+    fn nav_at_edge(&mut self, up: bool, cx: &mut Context<Self>) -> bool {
+        if !self.emit_nav {
+            return false;
+        }
+        let (line, _) = self.line_col(self.cursor_offset());
+        let at_edge = if up {
+            line == 0
+        } else {
+            line + 1 >= self.line_ranges().len()
+        };
+        if at_edge {
+            cx.emit(if up {
+                CodeEditorEvent::Up
+            } else {
+                CodeEditorEvent::Down
+            });
+        }
+        at_edge
     }
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         self.vertical(true, true, cx);

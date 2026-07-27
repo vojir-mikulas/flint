@@ -65,6 +65,18 @@ struct Gallery {
     segment: usize,
     select: usize,
     select_open: bool,
+
+    // --- SearchField demo: two shapes of the same combined control ---
+    /// The `[ mode ▾ │ term… ✕ ]` field: its input, chosen mode, and open state.
+    search_input: Entity<TextInput>,
+    search_mode: usize,
+    search_mode_open: bool,
+    /// The `[ column ▾ │ op ▾ │ value… + ]` field, showing a multi-slot run.
+    search_value: Entity<TextInput>,
+    search_column: usize,
+    search_column_open: bool,
+    search_op: usize,
+    search_op_open: bool,
     /// The right-clicked (row, column) + cursor position for the secondary-click
     /// table demo (exercises `Table::on_cell_secondary`).
     row_menu: Option<(usize, usize, Point<Pixels>)>,
@@ -341,6 +353,20 @@ impl Gallery {
             segment: 1,
             select: 0,
             select_open: false,
+            // `bare()`: the `SearchField` around them owns the chrome, which is
+            // the whole point of the component.
+            search_input: cx.new(|cx| {
+                TextInput::new(cx)
+                    .bare()
+                    .with_placeholder("Text in any column…")
+            }),
+            search_mode: 0,
+            search_mode_open: false,
+            search_value: cx.new(|cx| TextInput::new(cx).bare().with_placeholder("Value…")),
+            search_column: 0,
+            search_column_open: false,
+            search_op: 0,
+            search_op_open: false,
             palette,
             palette_open: false,
             prompt,
@@ -790,6 +816,115 @@ impl Gallery {
                     });
                 }),
         )
+    }
+
+    /// Two shapes of the same combined control, side by side: a mode + term
+    /// search box, and a three-slot predicate builder. Both are `SearchField`
+    /// with different slots — the component owns only the shared chrome.
+    fn search_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const MODES: [&str; 3] = ["Contains", "WHERE", "Column"];
+        const COLUMNS: [&str; 3] = ["id", "email", "amount"];
+        const OPS: [&str; 4] = ["=", "<>", ">=", "LIKE"];
+
+        // A `Select` that reports index changes back into `field` on the gallery.
+        let picker = |id: &'static str,
+                      options: &[&'static str],
+                      selected: usize,
+                      open: bool,
+                      set: fn(&mut Gallery, Option<usize>),
+                      cx: &mut Context<Self>| {
+            let mut select = Select::new(id).accent(false).seamless();
+            for o in options {
+                select = select.option(*o);
+            }
+            let toggle_view = cx.entity().downgrade();
+            let pick_view = cx.entity().downgrade();
+            select
+                .selected(selected)
+                .open(open)
+                .on_toggle(move |_, cx| {
+                    toggle_view
+                        .update(cx, |this, cx| {
+                            set(this, None);
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_select(move |ix, _, cx| {
+                    pick_view
+                        .update(cx, |this, cx| {
+                            set(this, Some(ix));
+                            cx.notify();
+                        })
+                        .ok();
+                })
+        };
+
+        let mode = picker(
+            "sf-mode",
+            &MODES,
+            self.search_mode,
+            self.search_mode_open,
+            |g, ix| match ix {
+                Some(ix) => {
+                    g.search_mode = ix;
+                    g.search_mode_open = false;
+                }
+                None => g.search_mode_open = !g.search_mode_open,
+            },
+            cx,
+        );
+        let column = picker(
+            "sf-column",
+            &COLUMNS,
+            self.search_column,
+            self.search_column_open,
+            |g, ix| match ix {
+                Some(ix) => {
+                    g.search_column = ix;
+                    g.search_column_open = false;
+                }
+                None => g.search_column_open = !g.search_column_open,
+            },
+            cx,
+        );
+        let op = picker(
+            "sf-op",
+            &OPS,
+            self.search_op,
+            self.search_op_open,
+            |g, ix| match ix {
+                Some(ix) => {
+                    g.search_op = ix;
+                    g.search_op_open = false;
+                }
+                None => g.search_op_open = !g.search_op_open,
+            },
+            cx,
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w(px(420.))
+            .child(
+                // One leading slot + a trailing affordance: the search box shape.
+                SearchField::new("sf-search")
+                    .slot(mode)
+                    .input(self.search_input.clone())
+                    .action(IconButton::new("sf-clear", "✕").size(IconButtonSize::Sm))
+                    .active(self.search_mode_open),
+            )
+            .child(
+                // Several slots read as one segmented run.
+                SearchField::new("sf-builder")
+                    .slot(column)
+                    .slot(op)
+                    .input(self.search_value.clone())
+                    .action(IconButton::new("sf-add", "＋").size(IconButtonSize::Sm))
+                    .active(self.search_column_open || self.search_op_open),
+            )
     }
 
     fn number_input(&self) -> impl IntoElement {
@@ -1546,6 +1681,7 @@ impl Render for Gallery {
         let checkboxes = self.checkboxes(cx);
         let segmented = self.segmented(cx);
         let select = self.select(cx);
+        let search_field = self.search_field(cx);
         let number_input = self.number_input();
         let context_menu = self.context_menu(cx);
         let toasts = self.toasts(cx);
@@ -1577,6 +1713,11 @@ impl Render for Gallery {
             .child(self.section("Checkbox", checkboxes, cx))
             .child(self.section("Segmented", segmented, cx))
             .child(self.section("Select", select, cx))
+            .child(self.section(
+                "Search field (combined slots + input + actions)",
+                search_field,
+                cx,
+            ))
             .child(self.section(
                 "Switcher (trigger + searchable sectioned popover)",
                 self.switcher.clone(),

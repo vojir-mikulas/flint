@@ -78,6 +78,7 @@ pub mod prelude {
     pub use crate::components::palette::{Palette, PaletteEvent, PaletteItem};
     pub use crate::components::progress_bar::ProgressBar;
     pub use crate::components::scrollbar::{Scrollbar, ScrollbarState};
+    pub use crate::components::search_field::SearchField;
     pub use crate::components::segmented::Segmented;
     pub use crate::components::select::Select;
     pub use crate::components::selectable_label::{SelectableLabel, SelectionGroup};
