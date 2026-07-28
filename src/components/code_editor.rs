@@ -75,6 +75,11 @@ actions!(
 /// How many undo steps the editor retains. Older steps drop off the bottom.
 const UNDO_LIMIT: usize = 200;
 
+/// Default padding above and below the code surface, sized for a full editor
+/// pane. A one-line editor in a compact bar overrides it via
+/// [`CodeEditor::vertical_padding`].
+const DEFAULT_VERTICAL_PADDING: Pixels = px(8.);
+
 /// A point-in-time editor state, captured before an edit so undo can restore it.
 #[derive(Clone)]
 struct EditSnapshot {
@@ -331,6 +336,9 @@ pub struct CodeEditor {
     /// bare Enter (no completion popup) emits [`CodeEditorEvent::Submit`] and
     /// Shift+Enter inserts a newline — the chat-composer convention.
     submit_on_enter: bool,
+    /// Vertical padding above and below the code surface (default 8px). See
+    /// [`Self::vertical_padding`].
+    vertical_padding: Pixels,
     /// Whether an arrow with nowhere left to go surfaces to the owner as
     /// [`CodeEditorEvent::Up`]/[`Down`](CodeEditorEvent::Down) (default `false`).
     /// See [`Self::emit_nav`].
@@ -416,6 +424,7 @@ impl CodeEditor {
             placeholder: SharedString::default(),
             gutter: true,
             submit_on_enter: false,
+            vertical_padding: DEFAULT_VERTICAL_PADDING,
             emit_nav: false,
             soft_wrap: false,
             desired_col: None,
@@ -496,6 +505,20 @@ impl CodeEditor {
     /// for a code surface, where Enter always inserts a line.
     pub fn submit_on_enter(mut self, submit: bool) -> Self {
         self.submit_on_enter = submit;
+        self
+    }
+
+    /// Breathing room above and below the code surface (default 8px, which suits a
+    /// full editor pane).
+    ///
+    /// Set it to zero for a **one-line editor in a compact bar** (a filter or
+    /// search field): at the default, 16px of padding inside a ~24px field pushes
+    /// the single line below the visible area, which both misplaces the text and
+    /// makes the content overflow — so the scrollbar appears on a buffer that has
+    /// nothing to scroll. The placeholder follows this value, so the hint lands
+    /// where the first glyph will.
+    pub fn vertical_padding(mut self, padding: Pixels) -> Self {
+        self.vertical_padding = padding;
         self
     }
 
@@ -2265,7 +2288,7 @@ impl Render for CodeEditor {
             .flex_1()
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
-            .py_2()
+            .py(self.vertical_padding)
             .child(
                 div()
                     .flex()
@@ -2283,7 +2306,9 @@ impl Render for CodeEditor {
             let left = if self.gutter { px(60.) } else { px(12.) };
             div()
                 .absolute()
-                .top(px(8.))
+                // Tracks the code surface's own padding, so the hint sits exactly
+                // where the first glyph will.
+                .top(self.vertical_padding)
                 .left(left)
                 .text_color(theme.text_dim)
                 .child(self.placeholder.clone())
