@@ -98,6 +98,8 @@ struct Gallery {
 
     // --- M0 spike B: multiline SQL editor ---
     sql_editor: Entity<CodeEditor>,
+    /// Prose composer demo: sizes to content between two and six rows.
+    composer: Entity<CodeEditor>,
     editor_readonly: bool,
     /// A one-line summary of the last query "run" (⌘↵ or the Run button).
     last_run: Option<SharedString>,
@@ -190,6 +192,18 @@ impl Gallery {
             cx.notify();
         })
         .detach();
+
+        // The prose variant: a chat-style composer that sizes to its content
+        // between two and six rows instead of filling its parent. Type past two
+        // lines — or one long line that wraps — and the box grows a row at a time,
+        // then scrolls once it hits six.
+        let composer = cx.new(|cx| {
+            CodeEditor::new(cx)
+                .gutter(false)
+                .soft_wrap(true)
+                .rows(2..=6)
+                .placeholder("Write a message — the box grows with it, up to six rows")
+        });
 
         // A command palette seeded with a spread of fake commands. Subscribing
         // logs the activated command and closes the overlay.
@@ -418,6 +432,7 @@ impl Gallery {
             slow: Arc::new(Mutex::new(SlowShared::default())),
 
             sql_editor,
+            composer,
             editor_readonly: false,
             last_run: None,
 
@@ -1653,6 +1668,16 @@ impl Gallery {
             .w_full()
             .child(self.sql_editor.clone())
             .child(bar)
+            // The prose counterpart, sized to its content rather than to its
+            // parent. Everything above fills whatever height it's given.
+            .child(
+                div()
+                    .mt_4()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(".rows(2..=6) — grows with the content, then scrolls"),
+            )
+            .child(div().mt_1().w_full().child(self.composer.clone()))
     }
 
     fn modal(&self, cx: &mut Context<Self>) -> impl IntoElement {

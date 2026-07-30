@@ -347,6 +347,9 @@ pub struct CodeEditor {
     /// (default `false`). For a prose surface like a chat composer. Off keeps the
     /// code-editor behaviour (one shaped line per logical line, horizontal scroll).
     soft_wrap: bool,
+    /// `(min, max)` visual rows to size the frame to, or `None` to fill the parent
+    /// (the default). See [`Self::rows`].
+    rows: Option<(usize, usize)>,
     /// Preserved column for vertical navigation, in bytes within a line.
     desired_col: Option<usize>,
     /// Corner radius of the editor frame; `None` uses `theme.radius`. `Some(px(0.))`
@@ -427,6 +430,7 @@ impl CodeEditor {
             vertical_padding: DEFAULT_VERTICAL_PADDING,
             emit_nav: false,
             soft_wrap: false,
+            rows: None,
             desired_col: None,
             corner_radius: None,
             resting_border: true,
@@ -541,6 +545,22 @@ impl CodeEditor {
     /// off for code, where horizontal scroll preserves column alignment.
     pub fn soft_wrap(mut self, wrap: bool) -> Self {
         self.soft_wrap = wrap;
+        self
+    }
+
+    /// Size the editor to its content between `min` and `max` visual rows instead
+    /// of filling whatever height its parent hands it. The editor starts `min`
+    /// rows tall, grows a row at a time as the content does, and stops at `max`,
+    /// past which it scrolls as before. Wrapped rows count as rows under
+    /// [`soft_wrap`](Self::soft_wrap), so a long paragraph grows the box the same
+    /// way pressing Return does.
+    ///
+    /// For a composer that should start roomy but never take over the panel:
+    /// `.rows(4..=8)`. Leave it unset to keep the fill-the-parent default, which
+    /// is what an editor in a resizable pane wants.
+    pub fn rows(mut self, rows: std::ops::RangeInclusive<usize>) -> Self {
+        let (min, max) = (*rows.start(), *rows.end());
+        self.rows = Some((min.max(1), max.max(min.max(1))));
         self
     }
 
@@ -802,6 +822,25 @@ impl CodeEditor {
     /// The caret's byte offset into [`content`](Self::content) (the selection's
     /// active end). Lets a host scope an action to the caret — e.g. running just
     /// the statement under the cursor.
+    /// How many visual rows the content occupies: logical lines, or wrap rows when
+    /// [`soft_wrap`](Self::soft_wrap) is on, measured at the width of the last
+    /// paint. Before the first paint (no cached width) it falls back to the logical
+    /// line count, which the next frame corrects. Never less than the logical line
+    /// count, so a scroll container sized from this never under-sizes.
+    fn visual_rows(&self, window: &mut Window) -> usize {
+        let lines = self.content.split('\n').count().max(1);
+        if !self.soft_wrap {
+            return lines;
+        }
+        match self.last_bounds {
+            Some(b) if b.size.width > px(0.) => {
+                visual_row_count(&self.content, b.size.width, window.line_height(), window)
+                    .max(lines)
+            }
+            _ => lines,
+        }
+    }
+
     pub fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start
@@ -1765,25 +1804,11 @@ impl Element for CodeElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let editor = self.editor.read(cx);
         let line_height = window.line_height();
-        let line_count = editor.content.split('\n').count().max(1);
-        // Soft-wrap height depends on the available width. We don't have this frame's
-        // width yet, so reuse the previous paint's width to count visual rows; on the
-        // first frame (no cached width) fall back to the logical line count, which the
-        // next frame corrects. The visual-row count is an upper bound on logical
-        // lines, so the scroll container never under-sizes for long content.
-        let rows = if editor.soft_wrap {
-            match editor.last_bounds {
-                Some(b) if b.size.width > px(0.) => {
-                    visual_row_count(&editor.content, b.size.width, line_height, window)
-                        .max(line_count)
-                }
-                _ => line_count,
-            }
-        } else {
-            line_count
-        };
+        // Soft-wrap height depends on the available width, which this frame doesn't
+        // know yet; `visual_rows` reuses the previous paint's width and self-corrects
+        // on the next frame.
+        let rows = self.editor.read(cx).visual_rows(window);
         let mut style = Style::default();
         style.size.width = gpui::relative(1.).into();
         style.size.height = (line_height * rows as f32).into();
@@ -2294,7 +2319,12 @@ impl Render for CodeEditor {
                     .flex()
                     .items_start()
                     .when_some(gutter, |row, g| row.child(g))
-                    .child(div().flex_1().pl_3().child(CodeElement {
+                    // Symmetric horizontal padding: the text is inset from the
+                    // frame by the same amount on both sides, and soft-wrap
+                    // measures against the padded width, so a wrapped line breaks
+                    // at the inset rather than against the frame edge. The right
+                    // inset also keeps text clear of the overlaid scrollbar.
+                    .child(div().flex_1().px_3().child(CodeElement {
                         editor: cx.entity(),
                     })),
             );
@@ -2482,11 +2512,24 @@ impl Render for CodeEditor {
                 window.refresh();
             });
 
+        // With a row range the frame sizes to its content between those bounds
+        // (`rows`); without one it fills whatever the parent hands it, which is what
+        // an editor in a resizable pane wants. The padding is the scroll area's own,
+        // counted once at each end so the first and last row aren't cropped.
+        let framed_height = self.rows.map(|(min, max)| {
+            let rows = self.visual_rows(window).clamp(min, max);
+            line_height * rows as f32 + self.vertical_padding * 2.
+        });
+
         div()
             .relative()
             .flex()
             .flex_col()
-            .size_full()
+            .w_full()
+            .map(|frame| match framed_height {
+                Some(h) => frame.h(h).flex_shrink_0(),
+                None => frame.h_full(),
+            })
             .bg(theme.bg_app)
             .border_1()
             .border_color(if focused {
