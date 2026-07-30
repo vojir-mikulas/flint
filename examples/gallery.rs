@@ -108,6 +108,11 @@ struct Gallery {
     split_v_size: Pixels,
     split_v_drag: Option<DragAnchor>,
 
+    // --- SplitStack demo: caller-owned weights + the in-flight divider drag.
+    // Weights, not pixels: resize the window and every column keeps its share.
+    stack_weights: Vec<f32>,
+    stack_drag: Option<DividerDrag>,
+
     // --- Tree demo: caller-owned expansion (by node path) + selection ---
     tree_expanded: HashSet<String>,
     tree_selected: Option<usize>,
@@ -420,6 +425,8 @@ impl Gallery {
             split_h_drag: None,
             split_v_size: px(120.),
             split_v_drag: None,
+            stack_weights: vec![0.5, 0.25, 0.25],
+            stack_drag: None,
 
             tree_expanded: ["src", "src/components"]
                 .iter()
@@ -537,6 +544,77 @@ impl Gallery {
             .border_1()
             .border_color(border)
             .child(outer)
+    }
+
+    /// N columns sized by weight, with a divider between each pair. Drag one and
+    /// only the two columns it sits between move; resize the window and all
+    /// three keep their proportions. `SplitPane` cannot express this: it holds
+    /// two panes and pins one of them in pixels.
+    fn split_stack(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, border, radius, muted) = (
+            theme.bg_panel_2,
+            theme.border,
+            theme.radius,
+            theme.text_muted,
+        );
+        let view = cx.entity();
+
+        let mut stack = SplitStack::new("gallery-split-stack", Axis::Horizontal)
+            .min(px(80.))
+            .drag(self.stack_drag);
+        for weight in &self.stack_weights {
+            stack = stack.child(
+                *weight,
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(bg)
+                    .text_color(muted)
+                    .text_sm()
+                    .child(format!("{:.0}%", weight * 100.)),
+            );
+        }
+
+        let start = view.clone();
+        let resize = view.clone();
+        let end = view.clone();
+        let stack = stack
+            .on_drag_start(move |drag, _, cx| {
+                start.update(cx, |t, cx| {
+                    t.stack_drag = Some(drag);
+                    cx.notify();
+                })
+            })
+            .on_resize(move |gutter, leading, _, cx| {
+                resize.update(cx, |t, cx| {
+                    // The pair's total is preserved, so the columns either side of
+                    // this divider are the only ones that move.
+                    let pair = t.stack_weights[gutter] + t.stack_weights[gutter + 1];
+                    let min = 0.08_f32.min(pair / 2.);
+                    let first = leading.clamp(min, pair - min);
+                    t.stack_weights[gutter] = first;
+                    t.stack_weights[gutter + 1] = pair - first;
+                    cx.notify();
+                })
+            })
+            .on_drag_end(move |_, cx| {
+                end.update(cx, |t, cx| {
+                    t.stack_drag = None;
+                    cx.notify();
+                })
+            });
+
+        div()
+            .w_full()
+            .h(px(160.))
+            .rounded(radius)
+            .overflow_hidden()
+            .border_1()
+            .border_color(border)
+            .child(stack)
     }
 
     /// A virtualized disclosure tree. The example owns expansion (a set of node
@@ -1688,6 +1766,7 @@ impl Render for Gallery {
         let selectable_label = self.selectable_label();
         let tooltip = self.tooltip_demo();
         let split_pane = self.split_pane(cx);
+        let split_stack = self.split_stack(cx);
         let tree = self.tree(cx);
         let table = self.table(cx);
         let secondary_table = self.secondary_table(cx);
@@ -1775,6 +1854,7 @@ impl Render for Gallery {
                 ),
             )
             .child(self.section("Split pane (nested, resizable)", split_pane, cx))
+            .child(self.section("Split stack (n-ary, weighted)", split_stack, cx))
             .child(self.section("Tree (virtualized, disclosure)", tree, cx))
             .child(self.section("Table", table, cx))
             .child(self.section("Table - right-click menu", secondary_table, cx))

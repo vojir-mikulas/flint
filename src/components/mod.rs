@@ -25,6 +25,7 @@ pub mod segmented;
 pub mod select;
 pub mod selectable_label;
 pub mod split_pane;
+pub mod split_stack;
 pub mod switcher;
 pub mod table;
 pub mod tabs;

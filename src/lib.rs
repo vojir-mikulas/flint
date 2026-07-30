@@ -42,6 +42,7 @@ pub use components::segmented::Segmented;
 pub use components::select::Select;
 pub use components::selectable_label::{SelectableLabel, SelectionGroup};
 pub use components::split_pane::{DragAnchor, SplitPane, SplitSide};
+pub use components::split_stack::{DividerDrag, SplitStack};
 pub use components::switcher::{
     Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,
 };
@@ -83,6 +84,7 @@ pub mod prelude {
     pub use crate::components::select::Select;
     pub use crate::components::selectable_label::{SelectableLabel, SelectionGroup};
     pub use crate::components::split_pane::{DragAnchor, SplitPane, SplitSide};
+    pub use crate::components::split_stack::{DividerDrag, SplitStack};
     pub use crate::components::switcher::{
         Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,
     };
