@@ -30,6 +30,7 @@ pub struct Select {
     accent: bool,
     seamless: bool,
     placeholder: SharedString,
+    height: Option<Pixels>,
     chevron: Option<AnyElement>,
     check: Option<AnyElement>,
     on_toggle: Option<ToggleHandler>,
@@ -37,6 +38,9 @@ pub struct Select {
 }
 
 impl Select {
+    /// Resting trigger height when [`height`](Self::height) is unset.
+    pub const DEFAULT_HEIGHT: Pixels = px(24.);
+
     pub fn new(id: impl Into<SharedString>) -> Self {
         Self {
             id: id.into(),
@@ -46,6 +50,7 @@ impl Select {
             accent: true,
             seamless: false,
             placeholder: "Select…".into(),
+            height: None,
             chevron: None,
             check: None,
             on_toggle: None,
@@ -82,6 +87,16 @@ impl Select {
     /// list are unchanged; only the resting chrome is removed.
     pub fn seamless(mut self) -> Self {
         self.seamless = true;
+        self
+    }
+
+    /// Trigger height, overriding the default [`DEFAULT_HEIGHT`](Self::DEFAULT_HEIGHT).
+    /// For lining the control up with whatever it sits beside in a dense toolbar,
+    /// where a couple of pixels out reads as a misalignment. Pass a
+    /// [`Theme::scale`](crate::Theme::scale)d value so it tracks the user's font
+    /// size rather than pinning to one.
+    pub fn height(mut self, height: Pixels) -> Self {
+        self.height = Some(height);
         self
     }
 
@@ -184,7 +199,7 @@ impl RenderOnce for Select {
             .flex()
             .items_center()
             .gap_1p5()
-            .h(px(24.))
+            .h(self.height.unwrap_or(Self::DEFAULT_HEIGHT))
             // Allow the trigger to shrink below its content width in a tight
             // toolbar; the label truncates rather than overflowing its row.
             .min_w(px(0.))
