@@ -234,6 +234,8 @@ type ColumnDragStartHandler = dyn Fn(ColumnDrag, &mut Window, &mut App) + 'stati
 type ColumnResizeHandler = dyn Fn(usize, Pixels, &mut Window, &mut App) + 'static;
 /// Ends a drag (mouse released, anywhere).
 type DragEndHandler = dyn Fn(&mut Window, &mut App) + 'static;
+/// Right-click on a header cell `(column, cursor position)`, to anchor a menu.
+type HeaderSecondaryHandler = dyn Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static;
 /// Reports the currently visible row range on every paint, *before* the rows in
 /// it are rendered. Lets a caller back the table with a windowed/streaming data
 /// source: prefetch the window around the viewport and evict everything else, so
@@ -314,6 +316,7 @@ pub struct Table<D: 'static = ()> {
     on_column_resize: Option<Rc<ColumnResizeHandler>>,
     on_column_resize_end: Option<Rc<DragEndHandler>>,
     on_column_auto_fit: Option<Rc<IndexHandler>>,
+    on_header_secondary: Option<Rc<HeaderSecondaryHandler>>,
     on_select: Option<Rc<RowClickHandler>>,
     on_secondary: Option<Rc<RowSecondaryHandler>>,
     on_activate: Option<Rc<IndexHandler>>,
@@ -377,6 +380,7 @@ impl<D: 'static> Table<D> {
             on_column_resize: None,
             on_column_resize_end: None,
             on_column_auto_fit: None,
+            on_header_secondary: None,
             on_select: None,
             on_secondary: None,
             on_activate: None,
@@ -628,6 +632,17 @@ impl<D: 'static> Table<D> {
         self
     }
 
+    /// Right-click on a header cell: `(column, cursor position)`. The caller
+    /// anchors its own menu there, exactly as it does for
+    /// [`on_cell_secondary`](Self::on_cell_secondary).
+    pub fn on_header_secondary(
+        mut self,
+        handler: impl Fn(usize, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_header_secondary = Some(Rc::new(handler));
+        self
+    }
+
     pub fn on_sort(mut self, handler: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
         self.on_sort = Some(Rc::new(Box::new(handler)));
         self
@@ -796,6 +811,7 @@ impl<D: 'static> RenderOnce for Table<D> {
         let on_sort = self.on_sort.clone();
         let on_column_resize_start = self.on_column_resize_start.clone();
         let on_column_auto_fit = self.on_column_auto_fit.clone();
+        let on_header_secondary = self.on_header_secondary.clone();
         let caret_asc = self.sort_caret_asc.clone();
         let caret_desc = self.sort_caret_desc.clone();
         let header_cells = columns.iter().enumerate().map(|(ix, column)| {
@@ -844,6 +860,13 @@ impl<D: 'static> RenderOnce for Table<D> {
             let cell = cell_layout(cell, column, column.align)
                 .when(grid_lines, |c| c.border_r_1().border_color(line));
 
+            let on_secondary = on_header_secondary.clone();
+            let cell = cell.when_some(on_secondary, |this, handler| {
+                this.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    cx.stop_propagation();
+                    handler(ix, event.position, window, cx);
+                })
+            });
             let cell = if column.sortable {
                 cell.cursor_pointer()
                     .hover(|s| s.text_color(theme.text))
