@@ -24,9 +24,10 @@ pub use components::badge::{Badge, BadgeVariant};
 pub use components::button::{Button, ButtonSize, ButtonVariant};
 pub use components::checkbox::Checkbox;
 pub use components::code_editor::{
-    CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider, Decoration,
-    DecorationProvider, DecorationStyle, GutterMarkerProvider, Highlighter, HoverProvider,
-    RichCompletionProvider, TokenStyle,
+    CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider,
+    ContextMenuProvider, ContextMenuTarget, Decoration, DecorationProvider, DecorationStyle,
+    EditMenuLabels, GutterMarkerProvider, Highlighter, HoverProvider, RichCompletionProvider,
+    TokenStyle,
 };
 pub use components::combo_box::{ComboBox, ComboBoxEvent};
 pub use components::context_menu::{ContextMenu, ContextMenuItem, Submenu};
@@ -46,7 +47,9 @@ pub use components::split_stack::{DividerDrag, SplitStack};
 pub use components::switcher::{
     Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,
 };
-pub use components::table::{CellRange, Column, ColumnAlign, ColumnWidth, Table, TableNav};
+pub use components::table::{
+    CellRange, Column, ColumnAlign, ColumnDrag, ColumnWidth, Table, TableNav, MIN_COLUMN_WIDTH,
+};
 pub use components::tabs::Tabs;
 pub use components::text_input::{TextInput, TextInputEvent};
 pub use components::toast::{Toast, ToastVariant};
@@ -64,8 +67,9 @@ pub mod prelude {
     pub use crate::components::checkbox::Checkbox;
     pub use crate::components::code_editor::{
         CodeEditor, CodeEditorEvent, CompletionItem, CompletionKind, CompletionProvider,
-        Decoration, DecorationProvider, DecorationStyle, GutterMarkerProvider, Highlighter,
-        HoverProvider, RichCompletionProvider, TokenStyle,
+        ContextMenuProvider, ContextMenuTarget, Decoration, DecorationProvider, DecorationStyle,
+        EditMenuLabels, GutterMarkerProvider, Highlighter, HoverProvider, RichCompletionProvider,
+        TokenStyle,
     };
     pub use crate::components::combo_box::{ComboBox, ComboBoxEvent};
     pub use crate::components::context_menu::{ContextMenu, ContextMenuItem, Submenu};
@@ -89,7 +93,7 @@ pub mod prelude {
         Switcher, SwitcherBadge, SwitcherEvent, SwitcherItem, SwitcherSection, TriggerBorder,
     };
     pub use crate::components::table::{
-        CellRange, Column, ColumnAlign, ColumnWidth, Table, TableNav,
+        CellRange, Column, ColumnAlign, ColumnDrag, ColumnWidth, Table, TableNav,
     };
     pub use crate::components::tabs::Tabs;
     pub use crate::components::text_input::{TextInput, TextInputEvent};

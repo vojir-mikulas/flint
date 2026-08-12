@@ -26,6 +26,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::components::context_menu::{ContextMenu, ContextMenuItem};
 use crate::components::floating::floating;
 use crate::components::scrollbar::{Scrollbar, ScrollbarState};
 use crate::theme::{ActiveTheme, Theme};
@@ -268,6 +269,53 @@ impl CompletionItem {
 /// plain string provider.
 pub type RichCompletionProvider = Rc<dyn Fn(&str, usize) -> Vec<CompletionItem>>;
 
+/// What a right-click landed on, handed to a [`ContextMenuProvider`] so the host
+/// can label and gate its items ("Run selection" vs "Run statement") without
+/// reading the editor entity back mid-render.
+#[derive(Clone, Debug)]
+pub struct ContextMenuTarget {
+    /// Caret byte offset after the click: inside a selection the click preserves
+    /// it, elsewhere the caret has already moved to the pointer.
+    pub offset: usize,
+    /// The text the menu acts on, or `None` when the click left no selection.
+    /// An item that rewrites it hands the replacement to
+    /// [`CodeEditor::replace_selection`].
+    pub selection: Option<String>,
+    /// Whether the editor refuses edits, so a mutating item can disable itself.
+    pub read_only: bool,
+}
+
+/// Builds the host's own right-click items. They lead the menu, above the
+/// built-in editing block (see [`CodeEditor::context_menu`]).
+pub type ContextMenuProvider = Rc<dyn Fn(&ContextMenuTarget) -> Vec<ContextMenuItem>>;
+
+/// Labels for the built-in editing items, so a localized host can translate
+/// them. English by default, like the `Select` / `ComboBox` placeholders.
+#[derive(Clone, Debug)]
+pub struct EditMenuLabels {
+    pub cut: SharedString,
+    pub copy: SharedString,
+    pub paste: SharedString,
+    pub select_all: SharedString,
+}
+
+impl Default for EditMenuLabels {
+    fn default() -> Self {
+        Self {
+            cut: "Cut".into(),
+            copy: "Copy".into(),
+            paste: "Paste".into(),
+            select_all: "Select All".into(),
+        }
+    }
+}
+
+/// The clipboard modifier shown in the built-in menu's shortcut hints.
+#[cfg(target_os = "macos")]
+const MENU_MOD: &str = "⌘";
+#[cfg(not(target_os = "macos"))]
+const MENU_MOD: &str = "Ctrl+";
+
 /// Emitted so the owner reacts to editor-level keys without the editor knowing
 /// what they mean.
 #[derive(Clone, Copy, Debug)]
@@ -380,6 +428,14 @@ pub struct CodeEditor {
     /// Optional dim label shown beside each candidate (see [`CompletionDetail`]).
     completion_detail: Option<CompletionDetail>,
     completion: Option<Completion>,
+    /// Where the open right-click menu is anchored (window space), or `None` when
+    /// no menu is up. Cleared by an outside click, Escape, or running an item.
+    context_menu: Option<Point<Pixels>>,
+    /// Supplies the host's own menu items for a right-click; the built-in editing
+    /// block renders under them either way.
+    context_menu_provider: Option<ContextMenuProvider>,
+    /// Labels for that built-in block (see [`EditMenuLabels`]).
+    edit_menu_labels: EditMenuLabels,
     /// Accessible name reported to assistive technology (default "Code editor").
     a11y_label: SharedString,
     /// Undo/redo stacks of pre-edit snapshots. `undo` pops the most recent prior
@@ -444,6 +500,9 @@ impl CodeEditor {
             rich_provider: None,
             completion_detail: None,
             completion: None,
+            context_menu: None,
+            context_menu_provider: None,
+            edit_menu_labels: EditMenuLabels::default(),
             a11y_label: SharedString::from("Code editor"),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -673,6 +732,36 @@ impl CodeEditor {
     ) {
         self.rich_provider = Some(Rc::new(f));
         cx.notify();
+    }
+
+    /// Add the host's own items to the right-click menu. The closure runs per
+    /// click with a [`ContextMenuTarget`] describing what was hit, and its items
+    /// render above the built-in Cut / Copy / Paste / Select All block (which is
+    /// always there, provider or not). Clicking any item closes the menu, so an
+    /// item's handler only has to do the work.
+    ///
+    /// The items' click handlers run outside the editor's render, so a host that
+    /// needs more than the target carries can read its own entity there.
+    pub fn context_menu(
+        mut self,
+        f: impl Fn(&ContextMenuTarget) -> Vec<ContextMenuItem> + 'static,
+    ) -> Self {
+        self.context_menu_provider = Some(Rc::new(f));
+        self
+    }
+
+    /// Translate the built-in editing items (default: English).
+    pub fn edit_menu_labels(mut self, labels: EditMenuLabels) -> Self {
+        self.edit_menu_labels = labels;
+        self
+    }
+
+    /// Replace the selection with `text` (insert it at the caret when there's no
+    /// selection), as one undo step. The editing seam a host command needs — a
+    /// context-menu item that rewrites the highlighted text, say — without
+    /// reaching for gpui's `EntityInputHandler`. A no-op while read-only.
+    pub fn replace_selection(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_text_in_range(None, text, window, cx);
     }
 
     pub fn content(&self) -> String {
@@ -1317,9 +1406,11 @@ impl CodeEditor {
         cx.emit(CodeEditorEvent::Run);
     }
     fn escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<Self>) {
-        // Esc first dismisses an open completion popup; with none open it's the
-        // owner's to act on (e.g. move focus out of the editor).
-        if self.completion.take().is_some() {
+        // Esc closes whichever transient surface is up — the right-click menu or
+        // the completion popup (opening the menu dismisses the popup, so never
+        // both). With neither open it's the owner's to act on, e.g. move focus
+        // out of the editor.
+        if self.context_menu.take().is_some() || self.completion.take().is_some() {
             cx.notify();
         } else {
             cx.emit(CodeEditorEvent::Escape);
@@ -1468,6 +1559,37 @@ impl CodeEditor {
     }
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+    }
+
+    /// Right-click: focus the editor and raise the context menu at the pointer.
+    ///
+    /// A click *inside* the selection keeps it, so the menu acts on the
+    /// highlighted text; a click anywhere else collapses it to a caret there
+    /// first — the platform convention, and it keeps the menu's labels honest
+    /// about what they'll affect.
+    fn on_right_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let offset = self.index_for_mouse_position(event.position);
+        if !self.selected_range.contains(&offset) {
+            self.move_to(offset, cx);
+        }
+        self.completion = None;
+        self.hovered = None;
+        self.context_menu = Some(event.position);
+        cx.notify();
+    }
+
+    /// Close the right-click menu, if one is open. Every menu item routes through
+    /// this, so a host item never has to dismiss the surface it was clicked in.
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
     }
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting {
@@ -2480,6 +2602,72 @@ impl Render for CodeEditor {
                 Some(floating(panel).at(at))
             });
 
+        // Right-click menu, anchored at the pointer. The host's items lead (a
+        // query editor puts "Run selection" here), then the editing block every
+        // text surface owes the user. Occluded so a click inside never reaches
+        // the text under it, and dismissed by an outside click or by any click
+        // that ran an item — the item's own handler is the deeper listener, so
+        // it fires before this one closes the menu.
+        let context_menu = self.context_menu.map(|at| {
+            let has_selection = !self.selected_range.is_empty();
+            let editable = !self.read_only;
+            let labels = self.edit_menu_labels.clone();
+            let mut menu = ContextMenu::new("code-editor-context-menu");
+            if let Some(provider) = self.context_menu_provider.clone() {
+                let items = provider(&ContextMenuTarget {
+                    offset: self.cursor_offset(),
+                    selection: self.selected_text(),
+                    read_only: self.read_only,
+                });
+                let had_items = !items.is_empty();
+                menu = items.into_iter().fold(menu, ContextMenu::item);
+                if had_items {
+                    menu = menu.separator();
+                }
+            }
+            let menu = menu
+                .item(
+                    ContextMenuItem::new("code-editor-cut", labels.cut)
+                        .shortcut(format!("{MENU_MOD}X"))
+                        .disabled(!has_selection || !editable)
+                        .on_click(cx.listener(|this, _, window, cx| this.cut(&Cut, window, cx))),
+                )
+                .item(
+                    ContextMenuItem::new("code-editor-copy", labels.copy)
+                        .shortcut(format!("{MENU_MOD}C"))
+                        .disabled(!has_selection)
+                        .on_click(cx.listener(|this, _, window, cx| this.copy(&Copy, window, cx))),
+                )
+                .item(
+                    ContextMenuItem::new("code-editor-paste", labels.paste)
+                        .shortcut(format!("{MENU_MOD}V"))
+                        .disabled(!editable)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.paste(&Paste, window, cx)),
+                        ),
+                )
+                .separator()
+                .item(
+                    ContextMenuItem::new("code-editor-select-all", labels.select_all)
+                        .shortcut(format!("{MENU_MOD}A"))
+                        .disabled(self.content.is_empty())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.select_all(&SelectAll, window, cx)
+                        })),
+                );
+            floating(
+                div()
+                    .occlude()
+                    .child(menu)
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.close_context_menu(cx)),
+                    )
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_context_menu(cx))),
+            )
+            .at(at)
+        });
+
         // A11y: a multi-line text-input node keyed off the focus handle. The
         // editor content is read by assistive technology through the platform
         // input handler registered in prepaint (`handle_input` above).
@@ -2585,6 +2773,7 @@ impl Render for CodeEditor {
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -2601,5 +2790,6 @@ impl Render for CodeEditor {
             .child(scrollbar)
             .children(popup)
             .children(hover_popup)
+            .children(context_menu)
     }
 }

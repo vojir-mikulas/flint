@@ -11,9 +11,10 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
-    ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, Pixels, Point, Role, ScrollHandle,
-    ScrollWheelEvent, SharedString, Styled, TouchPhase, UniformListScrollHandle, Window,
+    canvas, div, point, prelude::*, px, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
+    ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, MouseMoveEvent, Pixels, Point,
+    Role, ScrollHandle, ScrollWheelEvent, SharedString, Styled, TouchPhase,
+    UniformListScrollHandle, Window,
 };
 
 use crate::theme::ActiveTheme;
@@ -91,6 +92,30 @@ impl CellRange {
     }
 }
 
+/// Floor for a dragged column width, in pixels. Narrow enough to tuck a boolean
+/// column away, wide enough that the handle never becomes unreachable -- a
+/// column dragged to zero could not be dragged back.
+pub const MIN_COLUMN_WIDTH: f32 = 40.;
+
+/// Width of the invisible grab strip straddling a column's trailing edge.
+const RESIZE_HANDLE_W: f32 = 9.;
+
+/// Captured when a column-resize drag begins: the cursor's x and the column's
+/// width at that moment. Later cursor positions become
+/// `start_width + (cursor.x - start_x)`.
+///
+/// Mirrors `SplitPane`'s `DragAnchor`: the caller stores what
+/// [`Table::on_column_resize_start`] hands it and clears it on
+/// [`Table::on_column_resize_end`], so the in-flight drag is caller state and
+/// the table stays a pure render.
+#[derive(Clone, Copy, Debug)]
+pub struct ColumnDrag {
+    /// Which column is being resized.
+    pub column: usize,
+    pub start_x: Pixels,
+    pub start_width: Pixels,
+}
+
 #[derive(Clone)]
 pub struct Column {
     title: SharedString,
@@ -99,6 +124,7 @@ pub struct Column {
     width: ColumnWidth,
     align: ColumnAlign,
     sortable: bool,
+    resizable: bool,
 }
 
 impl Column {
@@ -109,6 +135,7 @@ impl Column {
             width: ColumnWidth::default(),
             align: ColumnAlign::default(),
             sortable: false,
+            resizable: false,
         }
     }
 
@@ -131,6 +158,20 @@ impl Column {
 
     pub fn align_end(mut self) -> Self {
         self.align = ColumnAlign::End;
+        self
+    }
+
+    /// Give this column a drag handle on its trailing edge.
+    ///
+    /// The table does not store the resulting width: like `sort` and
+    /// `selected_cells`, the caller owns it and feeds it back through
+    /// [`Column::width`]. That is what lets a caller persist widths, share one
+    /// set across two tables, or clamp them to its own rules.
+    ///
+    /// Only meaningful with [`ColumnWidth::Fixed`]: a flex column's width is a
+    /// share of what is left over, so there is no pixel value to drag.
+    pub fn resizable(mut self) -> Self {
+        self.resizable = true;
         self
     }
 
@@ -164,6 +205,16 @@ fn axis_lock_for(id: &SharedString) -> Rc<Cell<Option<bool>>> {
     })
 }
 
+/// The pixel width a resize handle should drag from, or `None` when the column
+/// has no handle. A flex column is excluded deliberately: its width is a share
+/// of the leftover space, so there is no value a drag could carry.
+fn resizable_width(column: &Column) -> Option<Pixels> {
+    match (column.resizable, column.width) {
+        (true, ColumnWidth::Fixed(w)) => Some(w),
+        _ => None,
+    }
+}
+
 fn cell_layout<E: Styled>(el: E, column: &Column, align: ColumnAlign) -> E {
     let el = match column.width {
         ColumnWidth::Fixed(w) => el.w(w).flex_shrink_0(),
@@ -176,6 +227,13 @@ fn cell_layout<E: Styled>(el: E, column: &Column, align: ColumnAlign) -> E {
 }
 
 type IndexHandler = Box<dyn Fn(usize, &mut Window, &mut App) + 'static>;
+/// Begins a column-resize drag: the caller stores the anchor and feeds it back
+/// through [`Table::column_drag`].
+type ColumnDragStartHandler = dyn Fn(ColumnDrag, &mut Window, &mut App) + 'static;
+/// New width for column `usize`, fired continuously during a drag.
+type ColumnResizeHandler = dyn Fn(usize, Pixels, &mut Window, &mut App) + 'static;
+/// Ends a drag (mouse released, anywhere).
+type DragEndHandler = dyn Fn(&mut Window, &mut App) + 'static;
 /// Reports the currently visible row range on every paint, *before* the rows in
 /// it are rendered. Lets a caller back the table with a windowed/streaming data
 /// source: prefetch the window around the viewport and evict everything else, so
@@ -248,6 +306,14 @@ pub struct Table<D: 'static = ()> {
     selected: Option<usize>,
     selected_set: Option<RowPredicate>,
     sort: Option<(usize, bool)>,
+    /// The column-resize drag in flight, or `None`. Caller-owned, like
+    /// `SplitPane::drag`; while it is `Some` the table paints a full-cover
+    /// overlay so the cursor keeps driving the drag outside the header.
+    column_drag: Option<ColumnDrag>,
+    on_column_resize_start: Option<Rc<ColumnDragStartHandler>>,
+    on_column_resize: Option<Rc<ColumnResizeHandler>>,
+    on_column_resize_end: Option<Rc<DragEndHandler>>,
+    on_column_auto_fit: Option<Rc<IndexHandler>>,
     on_select: Option<Rc<RowClickHandler>>,
     on_secondary: Option<Rc<RowSecondaryHandler>>,
     on_activate: Option<Rc<IndexHandler>>,
@@ -306,6 +372,11 @@ impl<D: 'static> Table<D> {
             selected: None,
             selected_set: None,
             sort: None,
+            column_drag: None,
+            on_column_resize_start: None,
+            on_column_resize: None,
+            on_column_resize_end: None,
+            on_column_auto_fit: None,
             on_select: None,
             on_secondary: None,
             on_activate: None,
@@ -508,6 +579,55 @@ impl<D: 'static> Table<D> {
         self
     }
 
+    /// The column-resize drag in flight (`None` when idle). The caller stores
+    /// what `on_column_resize_start` hands it and clears it in
+    /// `on_column_resize_end`.
+    pub fn column_drag(mut self, drag: Option<ColumnDrag>) -> Self {
+        self.column_drag = drag;
+        self
+    }
+
+    /// A resize handle was pressed. Store the [`ColumnDrag`] and feed it back
+    /// through [`Self::column_drag`] to arm the tracking overlay.
+    pub fn on_column_resize_start(
+        mut self,
+        handler: impl Fn(ColumnDrag, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_column_resize_start = Some(Rc::new(handler));
+        self
+    }
+
+    /// A resize drag moved: `(column, new width)`. Fired continuously, already
+    /// clamped to [`MIN_COLUMN_WIDTH`].
+    pub fn on_column_resize(
+        mut self,
+        handler: impl Fn(usize, Pixels, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_column_resize = Some(Rc::new(handler));
+        self
+    }
+
+    /// The resize drag ended (mouse released, inside the table or outside).
+    pub fn on_column_resize_end(
+        mut self,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_column_resize_end = Some(Rc::new(handler));
+        self
+    }
+
+    /// A resize handle was double-clicked: the caller sizes that column to its
+    /// content. The table cannot do this itself -- it never sees the cell text,
+    /// only the caller's rendered elements -- so the gesture is forwarded rather
+    /// than implemented here.
+    pub fn on_column_auto_fit(
+        mut self,
+        handler: impl Fn(usize, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_column_auto_fit = Some(Rc::new(Box::new(handler)));
+        self
+    }
+
     pub fn on_sort(mut self, handler: impl Fn(usize, &mut Window, &mut App) + 'static) -> Self {
         self.on_sort = Some(Rc::new(Box::new(handler)));
         self
@@ -674,6 +794,8 @@ impl<D: 'static> RenderOnce for Table<D> {
         let text_size = self.text_size;
 
         let on_sort = self.on_sort.clone();
+        let on_column_resize_start = self.on_column_resize_start.clone();
+        let on_column_auto_fit = self.on_column_auto_fit.clone();
         let caret_asc = self.sort_caret_asc.clone();
         let caret_desc = self.sort_caret_desc.clone();
         let header_cells = columns.iter().enumerate().map(|(ix, column)| {
@@ -722,7 +844,7 @@ impl<D: 'static> RenderOnce for Table<D> {
             let cell = cell_layout(cell, column, column.align)
                 .when(grid_lines, |c| c.border_r_1().border_color(line));
 
-            if column.sortable {
+            let cell = if column.sortable {
                 cell.cursor_pointer()
                     .hover(|s| s.text_color(theme.text))
                     .when_some(on_sort, |this, on_sort| {
@@ -731,7 +853,55 @@ impl<D: 'static> RenderOnce for Table<D> {
                     .into_any_element()
             } else {
                 cell.into_any_element()
-            }
+            };
+
+            // The handle straddles the column's trailing edge, so it is grabbable
+            // from either side of the line. Absolutely positioned inside a
+            // relative wrapper rather than added to the row: as a flex sibling it
+            // would consume width the column was told it had, and every column
+            // would render narrower than the caller asked for.
+            let Some(width) = resizable_width(column) else {
+                return cell;
+            };
+            let on_start = on_column_resize_start.clone();
+            let on_auto_fit = on_column_auto_fit.clone();
+            div()
+                .relative()
+                .flex_shrink_0()
+                .child(cell)
+                .child(
+                    div()
+                        .id(("flint-col-resize", ix))
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right(px(-RESIZE_HANDLE_W / 2.))
+                        .w(px(RESIZE_HANDLE_W))
+                        .cursor_ew_resize()
+                        .when_some(on_start, |this, handler| {
+                            this.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                                cx.stop_propagation();
+                                handler(
+                                    ColumnDrag {
+                                        column: ix,
+                                        start_x: event.position.x,
+                                        start_width: width,
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            })
+                        })
+                        .when_some(on_auto_fit, |this, handler| {
+                            this.on_click(move |event, window, cx| {
+                                if event.click_count() >= 2 {
+                                    cx.stop_propagation();
+                                    handler(ix, window, cx);
+                                }
+                            })
+                        }),
+                )
+                .into_any_element()
         });
 
         let header = div()
@@ -981,10 +1151,16 @@ impl<D: 'static> RenderOnce for Table<D> {
             None => list,
         };
 
+        // Read out before the two layout branches consume `self`, so the drag
+        // overlay can be applied to whichever one is built.
+        let column_drag = self.column_drag;
+        let on_column_resize = self.on_column_resize.clone();
+        let on_column_resize_end = self.on_column_resize_end.clone();
+
         // Wide mode: header + rows share one horizontally-scrolling, fixed-width
         // track, so they scroll in lockstep while the list still virtualizes
         // vertically. Otherwise columns flex to fit and there's no x-scroll.
-        if self.horizontal {
+        let body = if self.horizontal {
             let total: f32 = self
                 .columns
                 .iter()
@@ -1103,6 +1279,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                     None => d,
                 }
             })
+            .into_any_element()
         } else {
             div()
                 .id(self.id)
@@ -1120,6 +1297,42 @@ impl<D: 'static> RenderOnce for Table<D> {
                         None => d,
                     }
                 })
-        }
+                .into_any_element()
+        };
+
+        // While a resize drag is in flight, a full-cover overlay tracks the
+        // cursor anywhere over the table and ends the drag on release. Without
+        // it the drag would stop the moment the cursor left the 9px handle,
+        // which is every drag: the cursor outruns the column it is widening.
+        let Some(drag) = column_drag else {
+            return div().size_full().child(body);
+        };
+        div().relative().size_full().child(body).child(
+            div()
+                .id("flint-col-resize-overlay")
+                .occlude()
+                .absolute()
+                .inset_0()
+                .cursor_ew_resize()
+                .when_some(on_column_resize, |this, handler| {
+                    this.on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                        let delta = event.position.x - drag.start_x;
+                        let width = f32::from(drag.start_width + delta).max(MIN_COLUMN_WIDTH);
+                        handler(drag.column, px(width), window, cx);
+                    })
+                })
+                .when_some(on_column_resize_end, |this, handler| {
+                    let up = handler.clone();
+                    this.on_mouse_up(MouseButton::Left, move |_, window, cx| {
+                        up(window, cx);
+                    })
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        move |_, window, cx| {
+                            handler(window, cx);
+                        },
+                    )
+                }),
+        )
     }
 }

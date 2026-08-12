@@ -72,6 +72,10 @@ struct Gallery {
     modal_open: bool,
     selected_row: Option<usize>,
     sort: Option<(usize, bool)>,
+    /// Caller-owned column widths for the resizable-table demo, and the drag in
+    /// flight. The table renders these; it never stores them.
+    table_widths: Vec<gpui::Pixels>,
+    column_drag: Option<flint::ColumnDrag>,
     toggle_on: bool,
     segment: usize,
     select: usize,
@@ -155,10 +159,55 @@ struct Gallery {
 
 impl Gallery {
     fn new(cx: &mut Context<Self>, db_ready: Arc<AtomicBool>) -> Self {
+        // The right-click menu's host items reach back into the gallery (and
+        // through it, the editor). RED does the same with its app state — the
+        // handlers run outside the editor's render, so this is safe to update.
+        let gallery = cx.weak_entity();
         let sql_editor = cx.new(|cx| {
             CodeEditor::new(cx)
                 .with_content(SAMPLE_SQL)
                 .highlighter(sql::tokenize)
+                // Right-click seam demo: two host items above the built-in
+                // Cut / Copy / Paste / Select All block. RED puts "Run
+                // selection" / "Explain" / "Format SQL" here.
+                .context_menu(move |target| {
+                    let selection = target.selection.clone();
+                    let editable = !target.read_only;
+                    let gallery = gallery.clone();
+                    let editor = gallery.clone();
+                    vec![
+                        ContextMenuItem::new("gallery-run-selection", "Run selection")
+                            .shortcut("⌘↵")
+                            .disabled(selection.is_none())
+                            .on_click(move |_, _, cx| {
+                                let Some(sql) = selection.clone() else { return };
+                                gallery
+                                    .update(cx, |this, cx| {
+                                        this.last_run = Some(summarize_sql(&sql));
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            }),
+                        ContextMenuItem::new("gallery-upper", "Upper-case selection")
+                            .disabled(target.selection.is_none() || !editable)
+                            .on_click(move |_, window, cx| {
+                                editor
+                                    .update(cx, |this, cx| {
+                                        let editor = this.sql_editor.clone();
+                                        let upper = editor
+                                            .read(cx)
+                                            .selected_text()
+                                            .map(|s| s.to_uppercase());
+                                        if let Some(upper) = upper {
+                                            editor.update(cx, |ed, cx| {
+                                                ed.replace_selection(&upper, window, cx)
+                                            });
+                                        }
+                                    })
+                                    .ok();
+                            }),
+                    ]
+                })
                 // Diagnostics seam demo: wavy-underline every occurrence of a
                 // stand-in "unknown" token. RED supplies real schema-resolved
                 // ranges (unknown table/column); the editor only draws them.
@@ -420,6 +469,8 @@ impl Gallery {
             modal_open: false,
             selected_row: Some(2),
             sort: Some((0, true)),
+            table_widths: vec![gpui::px(220.), gpui::px(90.), gpui::px(150.)],
+            column_drag: None,
             toggle_on: true,
             segment: 1,
             select: 0,
@@ -1193,6 +1244,10 @@ impl Gallery {
     fn table(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let select_view = view.clone();
+        let drag_start_view = view.clone();
+        let resize_view = view.clone();
+        let drag_end_view = view.clone();
+        let auto_fit_view = view.clone();
         let theme = cx.theme();
         let dir_color = theme.blue;
         let muted = theme.text_muted;
@@ -1210,17 +1265,58 @@ impl Gallery {
                 Table::<()>::new(
                     "files",
                     vec![
-                        Column::new("Name").flex().sortable(),
+                        Column::new("Name")
+                            .width(self.table_widths[0])
+                            .sortable()
+                            .resizable(),
                         Column::new("Size")
-                            .width(gpui::px(90.))
+                            .width(self.table_widths[1])
                             .align_end()
-                            .sortable(),
-                        Column::new("Modified").width(gpui::px(150.)).sortable(),
+                            .sortable()
+                            .resizable(),
+                        Column::new("Modified")
+                            .width(self.table_widths[2])
+                            .sortable()
+                            .resizable(),
                     ],
                 )
                 .row_count(ROWS.len())
                 .selected(self.selected_row)
                 .sort(self.sort)
+                // Drag a header edge to resize; double-click one to auto-fit.
+                // The widths live here, in the caller, which is what lets them be
+                // persisted or shared between two tables.
+                .column_drag(self.column_drag)
+                .on_column_resize_start(move |drag, _window, cx| {
+                    drag_start_view.update(cx, |this, cx| {
+                        this.column_drag = Some(drag);
+                        cx.notify();
+                    });
+                })
+                .on_column_resize(move |col, width, _window, cx| {
+                    resize_view.update(cx, |this, cx| {
+                        if let Some(w) = this.table_widths.get_mut(col) {
+                            *w = width;
+                            cx.notify();
+                        }
+                    });
+                })
+                .on_column_resize_end(move |_window, cx| {
+                    drag_end_view.update(cx, |this, cx| {
+                        this.column_drag = None;
+                        cx.notify();
+                    });
+                })
+                .on_column_auto_fit(move |col, _window, cx| {
+                    // A real caller measures its content; the gallery just shows
+                    // the gesture arriving.
+                    auto_fit_view.update(cx, |this, cx| {
+                        if let Some(w) = this.table_widths.get_mut(col) {
+                            *w = gpui::px(160.);
+                            cx.notify();
+                        }
+                    });
+                })
                 .sort_carets(
                     move || {
                         div()
@@ -1652,7 +1748,8 @@ impl Gallery {
     }
 
     /// **M0 spike B** — the multiline SQL editor with live highlighting, a
-    /// line-number gutter, a Run (⌘↵) affordance and a read-only toggle.
+    /// line-number gutter, a Run (⌘↵) affordance, a read-only toggle, and a
+    /// right-click menu (host items over the built-in editing block).
     fn sql_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let muted = theme.text_muted;
@@ -1721,6 +1818,13 @@ impl Gallery {
             .w_full()
             .child(self.sql_editor.clone())
             .child(bar)
+            .child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("right-click the text — host items, then Cut / Copy / Paste"),
+            )
             // The prose counterpart, sized to its content rather than to its
             // parent. Everything above fills whatever height it's given.
             .child(
