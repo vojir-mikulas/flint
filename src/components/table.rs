@@ -999,49 +999,58 @@ impl<D: 'static> RenderOnce for Table<D> {
                     .map(|r| r(ix, window, cx))
                     .unwrap_or_default();
 
-                let laid_out = cells.into_iter().enumerate().map(|(c, cell)| {
-                    let column = &columns_for_rows[c];
-                    let is_cell_selected =
-                        selected_cells.is_some_and(|range| range.contains(ix, c));
-                    let cell_tint = cell_bg.as_ref().and_then(|f| f(ix, c));
-                    let on_cell_click = on_cell_click.clone();
-                    let on_cell_secondary = on_cell_secondary.clone();
-                    cell_layout(
-                        div()
-                            // A stable, allocation-free per-cell id: `(row, col)`
-                            // packed into one integer (col in the low 16 bits — no
-                            // table has 2^16 columns), under a `'static` name. The
-                            // old `format!("cell-{ix}-{c}")` heap-allocated a
-                            // `SharedString` for every visible cell every frame.
-                            .id(ElementId::NamedInteger(
-                                SharedString::new_static("cell"),
-                                ((ix as u64) << 16) | (c as u64),
-                            ))
-                            .flex()
-                            .items_center()
-                            .h_full()
-                            .px_2p5()
-                            .overflow_hidden()
-                            .when(grid_lines, |d| d.border_r_1().border_color(line))
-                            // A caller-supplied state tint paints first; the
-                            // selection highlight still wins on top of it.
-                            .when_some(cell_tint, |d, tint| d.bg(tint))
-                            .when(is_cell_selected, |d| d.bg(cell_selected))
-                            .when_some(on_cell_click, |d, handler| {
-                                d.cursor_pointer().on_click(move |event, window, cx| {
-                                    handler(ix, c, event, window, cx)
+                // A row is laid out against the columns that exist, dropping any
+                // surplus cells rather than indexing past them. The two come from
+                // separate caller decisions (the column list and the row
+                // renderer), so they can disagree for a frame while a column set
+                // changes -- and a data grid must not abort the process over a
+                // transient mismatch it will re-render out of next frame.
+                let laid_out = cells
+                    .into_iter()
+                    .zip(columns_for_rows.iter())
+                    .enumerate()
+                    .map(|(c, (cell, column))| {
+                        let is_cell_selected =
+                            selected_cells.is_some_and(|range| range.contains(ix, c));
+                        let cell_tint = cell_bg.as_ref().and_then(|f| f(ix, c));
+                        let on_cell_click = on_cell_click.clone();
+                        let on_cell_secondary = on_cell_secondary.clone();
+                        cell_layout(
+                            div()
+                                // A stable, allocation-free per-cell id: `(row, col)`
+                                // packed into one integer (col in the low 16 bits — no
+                                // table has 2^16 columns), under a `'static` name. The
+                                // old `format!("cell-{ix}-{c}")` heap-allocated a
+                                // `SharedString` for every visible cell every frame.
+                                .id(ElementId::NamedInteger(
+                                    SharedString::new_static("cell"),
+                                    ((ix as u64) << 16) | (c as u64),
+                                ))
+                                .flex()
+                                .items_center()
+                                .h_full()
+                                .px_2p5()
+                                .overflow_hidden()
+                                .when(grid_lines, |d| d.border_r_1().border_color(line))
+                                // A caller-supplied state tint paints first; the
+                                // selection highlight still wins on top of it.
+                                .when_some(cell_tint, |d, tint| d.bg(tint))
+                                .when(is_cell_selected, |d| d.bg(cell_selected))
+                                .when_some(on_cell_click, |d, handler| {
+                                    d.cursor_pointer().on_click(move |event, window, cx| {
+                                        handler(ix, c, event, window, cx)
+                                    })
                                 })
-                            })
-                            .when_some(on_cell_secondary, |d, handler| {
-                                d.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                                    handler(ix, c, event.position, window, cx)
+                                .when_some(on_cell_secondary, |d, handler| {
+                                    d.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                                        handler(ix, c, event.position, window, cx)
+                                    })
                                 })
-                            })
-                            .child(cell),
-                        column,
-                        column.align,
-                    )
-                });
+                                .child(cell),
+                            column,
+                            column.align,
+                        )
+                    });
 
                 // Only *test* the handlers here (borrow, no refcount bump); each
                 // is cloned into its `'static` event closure below, and only when
