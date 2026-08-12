@@ -1,12 +1,18 @@
-//! `ComboBox` — a searchable single-select dropdown: a `Select`-style trigger
-//! (the current value + a disclosure chevron) that opens an anchored popover with
-//! an embedded search field over a fuzzy-filtered list of options. The searchable
-//! sibling of [`Select`](super::select::Select), for long lists (themes, installed
-//! font families) where scanning a flat menu is painful.
+//! `ComboBox` — a searchable dropdown: a `Select`-style trigger (the current
+//! value + a disclosure chevron) that opens an anchored popover with an embedded
+//! search field over a fuzzy-filtered list of options. The searchable sibling of
+//! [`Select`](super::select::Select), for long lists (themes, installed font
+//! families) where scanning a flat menu is painful.
 //!
-//! Generic and domain-free: the owner hands it a list of option labels and the
-//! index of the current one, and reacts to [`ComboBoxEvent::Select`] with the
-//! chosen label — the combo box knows nothing about what an option *means*.
+//! Single-select by default. [`set_multi`](ComboBox::set_multi) switches it to a
+//! **multi-select filter**: every option carries its own check, a pick toggles
+//! rather than replaces and leaves the popover open (so several can be chosen in
+//! one visit), the trigger summarises the set as `First +2`, and a Clear appears
+//! beside the search field once anything is on.
+//!
+//! Generic and domain-free: the owner hands it a list of option labels and which
+//! are selected, and reacts to [`ComboBoxEvent::Select`] / [`ComboBoxEvent::Toggle`]
+//! with the label — the combo box knows nothing about what an option *means*.
 //!
 //! Stateful (held in an `Entity`) because it owns the embedded search field, the
 //! fuzzy filter, keyboard navigation, and its own open flag — the owner only
@@ -42,9 +48,16 @@ type LeadingFn = Box<dyn Fn(usize, &App) -> AnyElement + 'static>;
 /// What the owner subscribes to via `cx.subscribe`.
 #[derive(Clone, Debug)]
 pub enum ComboBoxEvent {
-    /// The user chose this option label (Enter or click). The owner maps the
-    /// label back to whatever it means (a theme name, a font family, …).
+    /// Single-select: the user chose this option label (Enter or click). The
+    /// owner maps the label back to whatever it means (a theme name, a font
+    /// family, …).
     Select(SharedString),
+    /// Multi-select: this option label was flipped. The combo has already applied
+    /// it to its own set, so `selected` says which way it went and the owner just
+    /// mirrors it.
+    Toggle { label: SharedString, selected: bool },
+    /// Multi-select: the popover's Clear was pressed; nothing is selected now.
+    Clear,
     /// The popover was dismissed (Escape or an outside click) without a choice.
     Dismiss,
 }
@@ -61,9 +74,15 @@ pub struct ComboBox {
     focus_handle: FocusHandle,
     input: Entity<TextInput>,
     options: Vec<SharedString>,
-    /// The currently-applied option: drawn with a check and shown in the trigger.
-    /// `None` shows the placeholder (no selection).
+    /// Single-select: the currently-applied option, drawn with a check and shown
+    /// in the trigger. `None` shows the placeholder (no selection). Unused in
+    /// multi-select, where [`selected`](Self::selected) is the whole answer.
     current: Option<usize>,
+    /// Multi-select: every applied option, in the order it was picked so the
+    /// trigger's summary doesn't reshuffle under the cursor. Empty = no filter.
+    selected: Vec<usize>,
+    /// Whether a pick toggles (and keeps the popover open) or replaces and closes.
+    multi: bool,
     filtered: Vec<Filtered>,
     /// Keyboard cursor over the `filtered` list (the highlighted row).
     cursor: usize,
@@ -79,9 +98,16 @@ pub struct ComboBox {
     /// Optional leading element per option (colour dot, glyph). Keyed by option
     /// index; drawn in the trigger and on each row. `None` = label only.
     leading: Option<LeadingFn>,
+    /// Optional trailing element per option (a count, a shortcut hint), drawn on
+    /// the popover row between the label and the check. Row-only: the trigger has
+    /// no room for it. `None` = nothing after the label.
+    trailing: Option<LeadingFn>,
     /// Stretch the trigger to fill its parent's width. Default `false` (the
     /// trigger sizes to its content, like a menu button).
     full_width: bool,
+    /// The trigger's height. Defaults to the compact 24px that lines up with
+    /// [`Select`](super::select::Select) in a settings row.
+    height: Pixels,
 }
 
 impl ComboBox {
@@ -117,6 +143,8 @@ impl ComboBox {
             input,
             options: Vec::new(),
             current: None,
+            selected: Vec::new(),
+            multi: false,
             filtered: Vec::new(),
             cursor: 0,
             open: false,
@@ -125,7 +153,9 @@ impl ComboBox {
             chevron: None,
             check: None,
             leading: None,
+            trailing: None,
             full_width: false,
+            height: px(24.),
         }
     }
 
@@ -204,11 +234,44 @@ impl ComboBox {
         cx.notify();
     }
 
+    /// A trailing element drawn after each option's label on the popover rows —
+    /// a match count, a shortcut hint. Keyed by the option's index like
+    /// [`set_leading`](Self::set_leading), and re-invoked each render so it
+    /// re-themes. Rows only: the trigger has no room for it.
+    pub fn set_trailing(
+        &mut self,
+        make: impl Fn(usize, &App) -> AnyElement + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.trailing = Some(Box::new(make));
+        cx.notify();
+    }
+
     /// Whether the trigger stretches to fill its parent's width. Off by default
     /// (the trigger sizes to content); on for form fields that line up with
     /// full-width inputs above and below them.
     pub fn set_full_width(&mut self, full: bool, cx: &mut Context<Self>) {
         self.full_width = full;
+        cx.notify();
+    }
+
+    /// The trigger's height, for a combo that has to line up with taller
+    /// neighbours (a filter dropdown beside a search field). Defaults to the
+    /// compact 24px of a settings row.
+    pub fn set_trigger_height(&mut self, height: Pixels, cx: &mut Context<Self>) {
+        self.height = height;
+        cx.notify();
+    }
+
+    /// Switch between picking one option and picking a set.
+    ///
+    /// In multi-select a pick toggles instead of replacing and the popover stays
+    /// open, so choosing three values is three clicks rather than three visits;
+    /// the trigger summarises the set and a Clear appears beside the search
+    /// field. Feed the set with [`set_options_selected`](Self::set_options_selected)
+    /// and react to [`ComboBoxEvent::Toggle`] / [`ComboBoxEvent::Clear`].
+    pub fn set_multi(&mut self, multi: bool, cx: &mut Context<Self>) {
+        self.multi = multi;
         cx.notify();
     }
 
@@ -227,11 +290,53 @@ impl ComboBox {
         cx.notify();
     }
 
+    /// The multi-select twin of [`set_options`](Self::set_options): replace the
+    /// option list and the whole selected set. Indices past the end of `options`
+    /// are dropped, so an owner can hand over a shrinking list without first
+    /// pruning its own set.
+    pub fn set_options_selected(
+        &mut self,
+        options: Vec<SharedString>,
+        selected: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.options = options;
+        self.selected = selected
+            .into_iter()
+            .filter(|&ix| ix < self.options.len())
+            .collect();
+        self.refilter(cx);
+        cx.notify();
+    }
+
+    /// Whether `option` carries a check, in either mode.
+    fn is_selected(&self, option: usize) -> bool {
+        if self.multi {
+            self.selected.contains(&option)
+        } else {
+            self.current == Some(option)
+        }
+    }
+
+    /// Drop the whole multi-select set (the popover's Clear). A no-op in
+    /// single-select, which has no "nothing chosen" gesture.
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.multi || self.selected.is_empty() {
+            return;
+        }
+        self.selected.clear();
+        cx.emit(ComboBoxEvent::Clear);
+        cx.notify();
+    }
+
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = true;
         self.needs_focus = true;
-        // Each open starts from a clean query.
+        // Each open starts from a clean query, and from no cursor history — so
+        // `refilter` parks the cursor on the current selection rather than
+        // holding wherever the last visit left it.
         self.input.update(cx, |input, cx| input.set_content("", cx));
+        self.filtered.clear();
         self.refilter(cx);
         let handle = self.input.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
@@ -260,6 +365,10 @@ impl ComboBox {
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
+        // Which option the cursor sits on right now. A refresh that leaves the
+        // list intact (a multi-select owner feeding back an updated selection
+        // mid-visit) must not throw the keyboard cursor back to the top.
+        let anchored = self.filtered.get(self.cursor).map(|f| f.option);
         let query = self.input.read(cx).content();
         let mut filtered = Vec::new();
         for (ix, label) in self.options.iter().enumerate() {
@@ -271,12 +380,19 @@ impl ComboBox {
             }
         }
         self.filtered = filtered;
-        // Park the cursor on the current selection when it survived the filter
-        // (so opening with an empty query highlights what's already chosen);
-        // otherwise fall back to the first match.
-        self.cursor = self
-            .current
-            .and_then(|cur| self.filtered.iter().position(|f| f.option == cur))
+        // Hold the cursor where it was if that option is still listed; else park
+        // it on the current selection when that survived the filter (so opening
+        // with an empty query highlights what's already chosen); else the first
+        // match. In multi-select the first selected option stands in for "the
+        // current one".
+        let anchor = if self.multi {
+            self.selected.first().copied()
+        } else {
+            self.current
+        };
+        self.cursor = anchored
+            .and_then(|opt| self.filtered.iter().position(|f| f.option == opt))
+            .or_else(|| anchor.and_then(|cur| self.filtered.iter().position(|f| f.option == cur)))
             .unwrap_or(0);
     }
 
@@ -297,16 +413,34 @@ impl ComboBox {
     }
 
     fn activate(&mut self, cursor: usize, cx: &mut Context<Self>) {
-        if let Some(f) = self.filtered.get(cursor) {
-            // The chosen row becomes the current selection straight away, so the
-            // trigger reflects the pick without waiting for the owner to feed the
-            // selection back via `set_options`.
-            self.current = Some(f.option);
-            let label = self.options[f.option].clone();
+        let Some(f) = self.filtered.get(cursor) else {
+            return;
+        };
+        let option = f.option;
+        let label = self.options[option].clone();
+        // The pick lands on our own state straight away, so the trigger and the
+        // checks reflect it without waiting for the owner to feed it back.
+        if self.multi {
+            // Toggle in place and stay open, query intact: choosing several
+            // values is the whole point of the mode, and reopening between each
+            // would make the third pick cost as much as the first.
+            let selected = match self.selected.iter().position(|&ix| ix == option) {
+                Some(at) => {
+                    self.selected.remove(at);
+                    false
+                }
+                None => {
+                    self.selected.push(option);
+                    true
+                }
+            };
+            cx.emit(ComboBoxEvent::Toggle { label, selected });
+        } else {
+            self.current = Some(option);
             self.open = false;
             cx.emit(ComboBoxEvent::Select(label));
-            cx.notify();
         }
+        cx.notify();
     }
 }
 
@@ -341,11 +475,22 @@ impl Render for ComboBox {
 
         // ----- trigger ----- (mirrors `Select`'s input-pill trigger so the closed
         // control looks identical to the non-searchable dropdown it replaces.)
-        let has_selection = self.current.is_some();
-        let current_label = self
-            .current
-            .and_then(|ix| self.options.get(ix).cloned())
-            .unwrap_or_else(|| self.placeholder.clone());
+        // Multi-select summarises the set as `First +2` rather than listing it:
+        // the trigger is one line, and the first pick plus a count says more in
+        // that line than two truncated labels would.
+        let lead_option = if self.multi {
+            self.selected.first().copied()
+        } else {
+            self.current
+        };
+        let has_selection = lead_option.is_some();
+        let current_label = match lead_option.and_then(|ix| self.options.get(ix).cloned()) {
+            None => self.placeholder.clone(),
+            Some(first) if self.multi && self.selected.len() > 1 => {
+                SharedString::from(format!("{first} +{}", self.selected.len() - 1))
+            }
+            Some(first) => first,
+        };
         // Caller's disclosure glyph (lucide chevron), else a stacked unicode mark.
         let chevron = match self.chevron.as_ref() {
             Some(make) => make(cx),
@@ -360,10 +505,10 @@ impl Render for ComboBox {
                 .child("⌄")
                 .into_any_element(),
         };
-        // The current selection's leading element (colour dot / glyph), if any.
-        let trigger_leading = self
-            .current
-            .and_then(|ix| self.leading.as_ref().map(|make| make(ix, cx)));
+        // The leading element (colour dot / glyph) of the option the trigger
+        // names, if any.
+        let trigger_leading =
+            lead_option.and_then(|ix| self.leading.as_ref().map(|make| make(ix, cx)));
         let trigger = div()
             .id(self.id.clone())
             .role(Role::ComboBox)
@@ -372,7 +517,7 @@ impl Render for ComboBox {
             .flex()
             .items_center()
             .gap_1p5()
-            .h(px(24.))
+            .h(self.height)
             .when(self.full_width, |t| t.w_full())
             .px_2()
             .rounded(theme.radius)
@@ -433,28 +578,35 @@ impl Render for ComboBox {
         let font_sm = theme.font_size_sm();
         let view = cx.entity().downgrade();
         let cursor = self.cursor;
-        let current = self.current;
 
-        // The single check for the active row (only one option is `current`): the
-        // caller's lucide check when set, else a unicode mark. Built once and moved
-        // into whichever filtered row is current.
-        let mut active_check: Option<AnyElement> =
-            self.current.map(|_| match self.check.as_ref() {
-                Some(make) => make(cx),
-                None => div()
-                    .flex_none()
-                    .text_size(font_sm)
-                    .text_color(accent)
-                    .child("✓")
-                    .into_any_element(),
-            });
-
-        // Leading element per visible row, built up front (they borrow `cx`); moved
-        // into the rows below by index. Empty when no leading factory is set.
+        // Per-row elements built up front (each borrows `cx`), then moved into the
+        // rows below by index. Multi-select checks every selected row, not just
+        // one, so the check is built per row rather than once and moved.
+        let mut row_checks: Vec<Option<AnyElement>> = self
+            .filtered
+            .iter()
+            .map(|f| {
+                self.is_selected(f.option)
+                    .then(|| match self.check.as_ref() {
+                        Some(make) => make(cx),
+                        None => div()
+                            .flex_none()
+                            .text_size(font_sm)
+                            .text_color(accent)
+                            .child("✓")
+                            .into_any_element(),
+                    })
+            })
+            .collect();
         let mut row_leadings: Vec<Option<AnyElement>> = self
             .filtered
             .iter()
             .map(|f| self.leading.as_ref().map(|make| make(f.option, cx)))
+            .collect();
+        let mut row_trailings: Vec<Option<AnyElement>> = self
+            .filtered
+            .iter()
+            .map(|f| self.trailing.as_ref().map(|make| make(f.option, cx)))
             .collect();
 
         let rows: Vec<_> = self
@@ -463,10 +615,11 @@ impl Render for ComboBox {
             .enumerate()
             .map(|(row_ix, f)| {
                 let is_cursor = row_ix == cursor;
-                let is_current = Some(f.option) == current;
+                let is_current = self.is_selected(f.option);
                 let view = view.clone();
-                let check = is_current.then(|| active_check.take()).flatten();
+                let check = row_checks[row_ix].take();
                 let leading = row_leadings[row_ix].take();
+                let trailing = row_trailings[row_ix].take();
                 div()
                     .id(("combo-row", row_ix))
                     .role(Role::ListBoxOption)
@@ -488,6 +641,7 @@ impl Render for ComboBox {
                         text,
                         accent,
                     )))
+                    .when_some(trailing, |d, el| d.child(el))
                     .when_some(check, |this, check| this.child(check))
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| this.activate(row_ix, cx)).ok();
@@ -517,15 +671,34 @@ impl Render for ComboBox {
                 .into_any_element()
         };
 
+        // Multi-select needs a way back to "no filter" that isn't unticking each
+        // value in turn; single-select has no such state to return to.
+        let clear = (self.multi && !self.selected.is_empty()).then(|| {
+            div()
+                .id("combo-clear")
+                .flex_none()
+                .px_1p5()
+                .py(px(1.))
+                .rounded(theme.radius_sm)
+                .text_size(theme.font_size_xs())
+                .text_color(text_faint)
+                .cursor_pointer()
+                .hover(move |s| s.text_color(text).bg(bg_hover))
+                .child("Clear")
+                .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx)))
+        });
+
         let input_row = div()
             .flex()
             .items_center()
+            .gap_2()
             .px(px(12.))
             .py(px(9.))
             .border_b_1()
             .border_color(theme.border)
             .text_size(font_sm)
-            .child(self.input.clone());
+            .child(div().flex_1().min_w_0().child(self.input.clone()))
+            .children(clear);
 
         let panel = div()
             .id("combo-popover")

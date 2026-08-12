@@ -33,6 +33,17 @@ use streaming::{
 
 const SAMPLE_SQL: &str = "-- M0 spike B: a multiline SQL editor surface\nSELECT u.id, u.email, count(o.id) AS orders\nFROM users u\nLEFT JOIN orders o ON o.user_id = u.id\nWHERE u.active = true AND u.score >= 42.0\nGROUP BY u.id, u.email\nHAVING count(o.id) > 0\nORDER BY orders DESC\nLIMIT 100;";
 
+/// Options for the multi-select `ComboBox` section: `(label, match count)`. The
+/// count rides the row's trailing slot, the shape a faceted filter wants.
+const MULTI_OPTIONS: &[(&str, usize)] = &[
+    ("Rust", 42),
+    ("TypeScript", 31),
+    ("Python", 27),
+    ("Go", 12),
+    ("Zig", 5),
+    ("Swift", 3),
+];
+
 /// Demo rows for the `Table` section: `(name, size, modified)`.
 const ROWS: &[(&str, &str, &str)] = &[
     ("assets", "—", "2026-05-31 14:02"),
@@ -133,6 +144,8 @@ struct Gallery {
 
     // --- ComboBox demo: a searchable single-select dropdown ---
     combo: Entity<ComboBox>,
+    /// The same control in multi-select (a faceted filter).
+    multi_combo: Entity<ComboBox>,
 
     // --- SelectableLabel demo: read-only highlight-and-copy text ---
     selectable: Entity<SelectableLabel>,
@@ -352,6 +365,45 @@ impl Gallery {
         })
         .detach();
 
+        // The same control in multi-select: picks toggle and the popover stays
+        // open, the trigger summarises the set, and each row carries a trailing
+        // count — the shape a faceted filter wants.
+        let multi_combo = cx.new(|cx| {
+            let mut c = ComboBox::new("demo-multi-combo", cx);
+            c.set_multi(true, cx);
+            c.set_placeholder("All languages", cx);
+            c.set_search_placeholder("Filter languages…", cx);
+            c.set_options_selected(
+                MULTI_OPTIONS.iter().map(|(s, _)| (*s).into()).collect(),
+                vec![0, 3],
+                cx,
+            );
+            c.set_full_width(true, cx);
+            c.set_trailing(
+                |ix, app| {
+                    div()
+                        .flex_none()
+                        .text_size(app.theme().font_size_xs())
+                        .text_color(app.theme().text_faint)
+                        .child(MULTI_OPTIONS[ix].1.to_string())
+                        .into_any_element()
+                },
+                cx,
+            );
+            c
+        });
+        cx.subscribe(&multi_combo, |this, _, event: &ComboBoxEvent, cx| {
+            this.last_command = match event {
+                ComboBoxEvent::Toggle { label, selected } => Some(
+                    format!("{} {label:?}", if *selected { "added" } else { "removed" }).into(),
+                ),
+                ComboBoxEvent::Clear => Some("cleared the filter".into()),
+                _ => this.last_command.take(),
+            };
+            cx.notify();
+        })
+        .detach();
+
         Self {
             name_input: cx.new(|cx| TextInput::new(cx).with_content("Production")),
             host_input: cx.new(|cx| TextInput::new(cx).with_placeholder("sftp.example.com")),
@@ -393,6 +445,7 @@ impl Gallery {
             last_command: None,
             switcher,
             combo,
+            multi_combo,
             row_menu: None,
             drag_items: vec![
                 DragItem {
@@ -1830,6 +1883,11 @@ impl Render for Gallery {
             .child(self.section(
                 "ComboBox (searchable single-select dropdown)",
                 self.combo.clone(),
+                cx,
+            ))
+            .child(self.section(
+                "ComboBox, multi-select (faceted filter: toggles, stays open, per-row counts)",
+                self.multi_combo.clone(),
                 cx,
             ))
             .child(self.section("Number input", number_input, cx))
