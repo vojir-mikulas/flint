@@ -11,18 +11,18 @@
 //! Domain-free by design — it takes a generic [`Highlighter`] callback (the SQL
 //! tokenizer lives in RED) and an optional [`CompletionProvider`] seam (RED feeds
 //! candidates from its introspected schema). The editor knows nothing about SQL.
-//! Deferred: soft-wrap, `tree-sitter`, horizontal scroll for long lines.
+//! Deferred: `tree-sitter`.
 
 use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    actions, div, fill, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context,
-    CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, GlobalElementId, Hsla, InspectorElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, Role,
-    ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WrappedLine,
+    actions, canvas, div, fill, point, prelude::*, px, size, App, Bounds, ClipboardItem,
+    ContentMask, Context, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla,
+    InspectorElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, Role, ScrollHandle, ScrollWheelEvent, ShapedLine,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -80,6 +80,12 @@ const UNDO_LIMIT: usize = 200;
 /// pane. A one-line editor in a compact bar overrides it via
 /// [`CodeEditor::vertical_padding`].
 const DEFAULT_VERTICAL_PADDING: Pixels = px(8.);
+
+/// Slack kept to the right of the caret when horizontal auto-scroll follows it,
+/// and the same amount of scrollable room past the longest line — so typing at
+/// the end of a long line leaves a couple of characters of breathing space
+/// instead of pinning the caret to the frame edge.
+const H_SCROLL_MARGIN: Pixels = px(24.);
 
 /// A point-in-time editor state, captured before an edit so undo can restore it.
 #[derive(Clone)]
@@ -459,6 +465,16 @@ pub struct CodeEditor {
     /// (then clears it). Gating on this — rather than scrolling every frame — lets the
     /// user wheel-scroll away from the caret without it snapping back.
     scroll_to_cursor: bool,
+    /// How far the code surface is scrolled right, in pixels (`0` = column 0 at the
+    /// left edge). The horizontal axis can't ride `scroll_handle`: that container
+    /// holds the gutter too, which must stay pinned while the text slides under it.
+    /// So the element applies this offset itself when it paints, and every
+    /// coordinate mapping below corrects for it. Always `0` under soft-wrap, where
+    /// nothing overflows sideways.
+    scroll_x: Pixels,
+    /// Width of the longest shaped line at the last paint — the clamp for
+    /// `scroll_x` between paints (a wheel tick can't reshape the text).
+    content_width: Pixels,
     // Cached from the last paint, for hit-testing between paints.
     last_bounds: Option<Bounds<Pixels>>,
     last_lines: Vec<ShapedLine>,
@@ -512,6 +528,8 @@ impl CodeEditor {
             scrollbar: ScrollbarState::new(),
             completion_scroll: ScrollHandle::new(),
             scroll_to_cursor: false,
+            scroll_x: px(0.),
+            content_width: px(0.),
             last_bounds: None,
             last_lines: Vec::new(),
             last_wrapped: Vec::new(),
@@ -930,6 +948,21 @@ impl CodeEditor {
         }
     }
 
+    /// Slide the code surface sideways by `delta` (positive = reveal text to the
+    /// right), clamped to the scrollable range measured at the last paint. Returns
+    /// whether it moved — a gesture with nowhere left to go is not this editor's.
+    /// Never moves under soft-wrap, where no line overflows.
+    fn scroll_x_by(&mut self, delta: Pixels) -> bool {
+        if self.soft_wrap {
+            return false;
+        }
+        let view = self.last_bounds.map_or(px(0.), |b| b.size.width);
+        let next = (self.scroll_x + delta).clamp(px(0.), max_scroll_x(self.content_width, view));
+        let moved = next != self.scroll_x;
+        self.scroll_x = next;
+        moved
+    }
+
     pub fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start
@@ -1106,7 +1139,7 @@ impl CodeEditor {
         }
         let (line, col) = self.line_col(c.start);
         let line = line.min(self.last_lines.len() - 1);
-        let x = self.last_lines[line].x_for_index(col);
+        let x = self.last_lines[line].x_for_index(col) - self.scroll_x;
         // Drop one line below the word's line, plus a small gap off the caret.
         let y = self.last_line_height * (line as f32 + 1.0) + px(2.);
         Some(bounds.origin + point(x, y))
@@ -1631,7 +1664,7 @@ impl CodeEditor {
         }
         let (line, col) = self.line_col(offset);
         let line = line.min(self.last_lines.len() - 1);
-        let x = self.last_lines[line].x_for_index(col);
+        let x = self.last_lines[line].x_for_index(col) - self.scroll_x;
         let y = self.last_line_height * (line as f32 + 1.0) + px(2.);
         Some(bounds.origin + point(x, y))
     }
@@ -1701,7 +1734,9 @@ impl CodeEditor {
             line = ranges.len() - 1;
         }
         let col = match self.last_lines.get(line) {
-            Some(shaped) => shaped.closest_index_for_x(position.x - bounds.left()),
+            // The text paints shifted left by `scroll_x`, so undo that shift before
+            // asking the shaped line which column the pointer landed on.
+            Some(shaped) => shaped.closest_index_for_x(position.x - bounds.left() + self.scroll_x),
             None => 0,
         };
         (ranges[line].start + col).min(ranges[line].end)
@@ -1866,7 +1901,7 @@ impl EntityInputHandler for CodeEditor {
         let range = self.range_from_utf16(&range_utf16);
         let (line, col) = self.line_col(range.start);
         let shaped = self.last_lines.get(line)?;
-        let x = shaped.x_for_index(col);
+        let x = shaped.x_for_index(col) - self.scroll_x;
         let y = bounds.top() + self.last_line_height * line as f32;
         Some(Bounds::from_corners(
             point(bounds.left() + x, y),
@@ -1899,6 +1934,10 @@ struct PrepaintState {
     line_height: Pixels,
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
+    /// Horizontal offset this frame's geometry was built against, resolved in
+    /// prepaint (caret-follow included) so text, caret and selection all land at
+    /// the same place in one pass. `0` under soft-wrap.
+    scroll_x: Pixels,
 }
 
 impl IntoElement for CodeElement {
@@ -1955,6 +1994,11 @@ impl Element for CodeElement {
         let content = editor.content.clone();
         let selected = editor.selected_range.clone();
         let cursor = editor.cursor_offset();
+        let soft_wrap = editor.soft_wrap;
+        // Read before shaping: the horizontal offset is resolved further down, and
+        // settling it needs a `&mut App`, which the `editor` borrow rules out.
+        let prev_scroll_x = editor.scroll_x;
+        let follow_cursor = editor.scroll_to_cursor;
         let tokens = editor
             .highlighter
             .as_ref()
@@ -1973,7 +2017,7 @@ impl Element for CodeElement {
         let line_height = window.line_height();
 
         // --- soft-wrap path: one wrapped layout per logical line, stacked ---
-        if editor.soft_wrap {
+        if soft_wrap {
             // Runs over the whole content (shape_text splits on newlines itself and
             // wants runs covering the full text): token colours + diagnostic underlines.
             let mut runs = shape_runs(
@@ -2073,6 +2117,16 @@ impl Element for CodeElement {
                 }
             }
 
+            // Wrapped text never overflows sideways; drop any offset left over from
+            // a stint with soft-wrap off, so hit-testing doesn't correct for a shift
+            // that isn't painted.
+            if prev_scroll_x != px(0.) {
+                self.editor.update(cx, |editor, _| {
+                    editor.scroll_x = px(0.);
+                    editor.content_width = px(0.);
+                });
+            }
+
             return PrepaintState {
                 lines: Vec::new(),
                 wrapped,
@@ -2080,6 +2134,7 @@ impl Element for CodeElement {
                 line_height,
                 cursor: caret,
                 selections,
+                scroll_x: px(0.),
             };
         }
 
@@ -2096,15 +2151,32 @@ impl Element for CodeElement {
             );
         }
 
-        // Caret.
+        // Horizontal scroll, resolved before any geometry is built so the text,
+        // caret and selection of this frame all agree on one offset (the vertical
+        // axis, which the scroll container owns, can only correct itself a frame
+        // late). Typing past the right edge and jumping to the end of a long line
+        // both land here, via `follow_cursor`.
         let (cline, ccol) = line_col(&ranges, cursor);
         let caret_x = lines[cline].x_for_index(ccol);
+        let content_width = lines.iter().map(|l| l.width).max().unwrap_or(px(0.));
+        let view_width = bounds.size.width;
+        let scroll_x = resolve_scroll_x(
+            prev_scroll_x,
+            caret_x,
+            content_width,
+            view_width,
+            follow_cursor,
+        );
+        self.editor.update(cx, |editor, _| {
+            editor.scroll_x = scroll_x;
+            editor.content_width = content_width;
+        });
+        let left = bounds.left() - scroll_x;
+
+        // Caret.
         let caret = fill(
             Bounds::new(
-                point(
-                    bounds.left() + caret_x,
-                    bounds.top() + line_height * cline as f32,
-                ),
+                point(left + caret_x, bounds.top() + line_height * cline as f32),
                 size(px(2.), line_height),
             ),
             cursor_color,
@@ -2131,8 +2203,8 @@ impl Element for CodeElement {
                 let top = bounds.top() + line_height * line as f32;
                 selections.push(fill(
                     Bounds::from_corners(
-                        point(bounds.left() + x0, top),
-                        point(bounds.left() + x1, top + line_height),
+                        point(left + x0, top),
+                        point(left + x1, top + line_height),
                     ),
                     selection_color,
                 ));
@@ -2146,6 +2218,7 @@ impl Element for CodeElement {
             line_height,
             cursor: Some(caret),
             selections,
+            scroll_x,
         }
     }
 
@@ -2166,25 +2239,34 @@ impl Element for CodeElement {
             cx,
         );
 
-        for selection in prepaint.selections.drain(..) {
-            window.paint_quad(selection);
-        }
-
         let line_height = prepaint.line_height;
         let lines = std::mem::take(&mut prepaint.lines);
         let wrapped = std::mem::take(&mut prepaint.wrapped);
         let tops = std::mem::take(&mut prepaint.tops);
-        if wrapped.is_empty() {
-            for (i, line) in lines.iter().enumerate() {
-                let origin = point(bounds.left(), bounds.top() + line_height * i as f32);
-                let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+        let left = bounds.left() - prepaint.scroll_x;
+
+        // Everything below is drawn at a horizontal offset, so a scrolled long line
+        // would otherwise spill over the gutter to the left (and past the padding to
+        // the right). Mask to the text column; the enclosing scroll container's own
+        // mask still handles the vertical edges.
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            for selection in prepaint.selections.drain(..) {
+                window.paint_quad(selection);
             }
-        } else {
-            for (i, line) in wrapped.iter().enumerate() {
-                let origin = point(bounds.left(), bounds.top() + tops[i]);
-                let _ = line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+            if wrapped.is_empty() {
+                for (i, line) in lines.iter().enumerate() {
+                    let origin = point(left, bounds.top() + line_height * i as f32);
+                    let _ =
+                        line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+                }
+            } else {
+                for (i, line) in wrapped.iter().enumerate() {
+                    let origin = point(left, bounds.top() + tops[i]);
+                    let _ =
+                        line.paint(origin, line_height, gpui::TextAlign::Left, None, window, cx);
+                }
             }
-        }
+        });
 
         // Caret-follow autoscroll: after an edit or caret move, nudge the scroll
         // offset so the caret sits inside the viewport. Gated on `scroll_to_cursor`
@@ -2216,7 +2298,9 @@ impl Element for CodeElement {
 
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
-                window.paint_quad(cursor);
+                window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    window.paint_quad(cursor);
+                });
             }
         }
 
@@ -2336,6 +2420,39 @@ fn visual_row_count(
         .max(1)
 }
 
+/// How far right a surface `view_w` wide can scroll over content `content_w`
+/// wide: the overhang, plus one [`H_SCROLL_MARGIN`] so the caret at the end of
+/// the longest line isn't pinned against the frame. `0` when everything fits.
+fn max_scroll_x(content_w: Pixels, view_w: Pixels) -> Pixels {
+    (content_w + H_SCROLL_MARGIN - view_w).max(px(0.))
+}
+
+/// The code surface's horizontal offset for this frame: `current` clamped to what
+/// the content allows, and — when `follow` is set (an edit or a caret move) —
+/// slid just far enough to bring `caret_x` back inside the viewport, keeping
+/// [`H_SCROLL_MARGIN`] of slack at whichever edge it crossed. Clamping alone runs
+/// every frame, so re-shaped or deleted text can't leave the surface scrolled
+/// past its own end.
+fn resolve_scroll_x(
+    current: Pixels,
+    caret_x: Pixels,
+    content_w: Pixels,
+    view_w: Pixels,
+    follow: bool,
+) -> Pixels {
+    let max = max_scroll_x(content_w, view_w);
+    let mut scroll_x = current.clamp(px(0.), max);
+    if follow && view_w > px(0.) {
+        if caret_x < scroll_x + H_SCROLL_MARGIN {
+            scroll_x = caret_x - H_SCROLL_MARGIN;
+        } else if caret_x > scroll_x + view_w - H_SCROLL_MARGIN {
+            scroll_x = caret_x + H_SCROLL_MARGIN - view_w;
+        }
+        scroll_x = scroll_x.clamp(px(0.), max);
+    }
+    scroll_x
+}
+
 /// Free version of [`CodeEditor::line_col`] over precomputed ranges, for the
 /// element (which holds ranges, not the entity).
 fn line_col(ranges: &[Range<usize>], offset: usize) -> (usize, usize) {
@@ -2430,7 +2547,7 @@ impl Render for CodeEditor {
                 }))
         });
 
-        let scroll_area = div()
+        let mut scroll_area = div()
             .id("code-scroll")
             .flex_1()
             .overflow_y_scroll()
@@ -2450,6 +2567,55 @@ impl Render for CodeEditor {
                         editor: cx.entity(),
                     })),
             );
+        // A container that scrolls one axis re-reads a delta on the *other* axis as
+        // its own unless this is set — so without it a sideways swipe scrolls the
+        // code up and down.
+        scroll_area.style().restrict_scroll_to_axis = Some(true);
+
+        // Horizontal scrolling, arbitrated ahead of that container. The x axis can't
+        // ride it: the gutter is inside it and has to stay pinned while the text
+        // slides under it, so the offset lives on the editor and the element applies
+        // it when it paints. This overlay claims the sideways half of a gesture in
+        // the *capture* phase — ahead of every bubble-phase listener, whatever the
+        // paint order — and swallows only the ticks that actually moved the surface,
+        // so a vertical swipe still reaches the container and an exhausted one still
+        // reaches an outer scroller. Same pattern as `Table`'s axis arbitration.
+        let wheel = (!self.soft_wrap).then(|| {
+            let editor = cx.entity();
+            canvas(
+                |_, _, _| (),
+                move |bounds: Bounds<Pixels>, _, window, _| {
+                    let line_height = window.line_height();
+                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, cx| {
+                        if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
+                            return;
+                        }
+                        let delta = event.delta.pixel_delta(line_height);
+                        // A sideways swipe, or Shift+wheel — the mouse-only way to
+                        // pan, which some platforms hand over as a vertical delta.
+                        let dx = if delta.x.abs() > delta.y.abs() {
+                            delta.x
+                        } else if event.modifiers.shift && delta.x == px(0.) {
+                            delta.y
+                        } else {
+                            return;
+                        };
+                        let moved = editor.update(cx, |editor, cx| {
+                            let moved = editor.scroll_x_by(-dx);
+                            if moved {
+                                cx.notify();
+                            }
+                            moved
+                        });
+                        if moved {
+                            cx.stop_propagation();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
+        });
 
         // Dim placeholder, shown only while the buffer is empty. An overlay (the
         // frame is `relative`) aligned to where the first glyph paints, so it never
@@ -2787,9 +2953,252 @@ impl Render for CodeEditor {
             // still wins mouse hits — the empty editor stays clickable to focus.
             .children(placeholder)
             .child(scroll_area)
+            // Painted after the code surface, so in the capture phase (which runs
+            // in paint order) it still arbitrates before the container it covers.
+            .children(wheel)
             .child(scrollbar)
             .children(popup)
             .children(hover_popup)
             .children(context_menu)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{max_scroll_x, resolve_scroll_x, H_SCROLL_MARGIN};
+    use gpui::{px, Pixels};
+
+    const VIEW: Pixels = px(400.);
+
+    /// Follow the caret from `current`, over content `content_w` wide.
+    fn follow(current: Pixels, caret_x: Pixels, content_w: Pixels) -> Pixels {
+        resolve_scroll_x(current, caret_x, content_w, VIEW, true)
+    }
+
+    #[test]
+    fn short_lines_never_scroll() {
+        assert_eq!(max_scroll_x(px(120.), VIEW), px(0.));
+        assert_eq!(follow(px(0.), px(120.), px(120.)), px(0.));
+    }
+
+    #[test]
+    fn typing_past_the_right_edge_follows_the_caret() {
+        // Caret just short of the edge: nothing moves yet.
+        assert_eq!(
+            follow(px(0.), VIEW - H_SCROLL_MARGIN - px(1.), px(900.)),
+            px(0.)
+        );
+        // Past it: the surface slides so the caret keeps its margin of slack.
+        let caret = px(500.);
+        assert_eq!(
+            follow(px(0.), caret, px(900.)),
+            caret + H_SCROLL_MARGIN - VIEW
+        );
+    }
+
+    #[test]
+    fn end_of_the_longest_line_scrolls_to_the_end() {
+        let content = px(900.);
+        // Caret at EOL of the longest line: the margin is exactly the room the
+        // clamp leaves past the content, so following it doesn't get clipped back.
+        assert_eq!(
+            follow(px(0.), content, content),
+            max_scroll_x(content, VIEW)
+        );
+    }
+
+    #[test]
+    fn walking_back_left_scrolls_back() {
+        // Caret at column 0 while scrolled deep right: back to the left edge.
+        assert_eq!(follow(px(600.), px(0.), px(1200.)), px(0.));
+        // Caret just inside the left margin: slid back to leave that slack.
+        assert_eq!(
+            follow(px(600.), px(610.), px(1200.)),
+            px(610.) - H_SCROLL_MARGIN
+        );
+    }
+
+    #[test]
+    fn caret_already_in_view_holds_the_offset() {
+        assert_eq!(follow(px(300.), px(500.), px(900.)), px(300.));
+    }
+
+    #[test]
+    fn a_standing_offset_is_clamped_to_reshaped_content() {
+        // Deleting the long line leaves the surface scrolled past its own end;
+        // the clamp runs whether or not the caret is being followed.
+        assert_eq!(
+            resolve_scroll_x(px(600.), px(10.), px(120.), VIEW, false),
+            px(0.)
+        );
+        assert_eq!(
+            resolve_scroll_x(px(600.), px(10.), px(700.), VIEW, false),
+            max_scroll_x(px(700.), VIEW)
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_viewport_leaves_the_offset_alone() {
+        // Before the first paint there is no viewport to follow the caret into.
+        assert_eq!(
+            resolve_scroll_x(px(0.), px(900.), px(900.), px(0.), true),
+            px(0.)
+        );
+    }
+
+    // --- painted behaviour: the offset only exists once the editor has laid out
+    // and shaped its lines, so these drive a real test window ---
+
+    use super::CodeEditor;
+    use gpui::{div, point, prelude::*, Entity, Window};
+
+    /// Host view for the windowed tests: one editor filling the window.
+    struct Harness {
+        editor: Entity<CodeEditor>,
+    }
+
+    impl gpui::Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.editor.clone())
+        }
+    }
+
+    /// A line far wider than any test window, so the surface has room to scroll.
+    const LONG_LINE: &str = "SELECT u.id, u.email, u.first_name, u.last_name, o.total, o.placed_at, p.sku, p.title FROM users u JOIN orders o ON o.user_id = u.id JOIN products p ON p.id = o.product_id WHERE u.active = true ORDER BY o.placed_at DESC;";
+
+    #[gpui::test]
+    fn the_caret_drags_the_surface_along_the_long_line(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(crate::theme::Theme::one_dark()));
+        let window = cx.add_window(|_, cx| Harness {
+            editor: cx.new(|cx| CodeEditor::new(cx).with_content(LONG_LINE)),
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let editor = window
+            .update(cx, |this, _, _| this.editor.clone())
+            .expect("window is open");
+        let scroll_x = |cx: &mut gpui::VisualTestContext| editor.read_with(cx, |e, _| e.scroll_x);
+
+        // Fresh content, caret at the top: the surface starts at column 0 and the
+        // long line is measured as overflowing.
+        assert_eq!(scroll_x(cx), px(0.));
+        assert!(
+            editor.read_with(cx, |e, _| e.content_width) > px(400.),
+            "the sample line should be wider than any test viewport"
+        );
+
+        // Jumping to the end of the line drags the surface with it — the bug this
+        // covers is exactly this offset staying at 0.
+        editor.update(cx, |e, cx| e.set_cursor(LONG_LINE.len(), cx));
+        cx.run_until_parked();
+        let at_end = scroll_x(cx);
+        assert!(
+            at_end > px(0.),
+            "end of a long line should scroll into view"
+        );
+
+        // …and it never scrolls further than the line's own end.
+        let max = editor.read_with(cx, |e, _| {
+            max_scroll_x(e.content_width, e.last_bounds.expect("painted").size.width)
+        });
+        assert_eq!(at_end, max);
+
+        // Back to the start, and the surface comes back with it.
+        editor.update(cx, |e, cx| e.set_cursor(0, cx));
+        cx.run_until_parked();
+        assert_eq!(scroll_x(cx), px(0.));
+    }
+
+    #[gpui::test]
+    fn deleting_the_overflow_releases_the_offset(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(crate::theme::Theme::one_dark()));
+        let window = cx.add_window(|_, cx| Harness {
+            editor: cx.new(|cx| CodeEditor::new(cx).with_content(LONG_LINE)),
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let editor = window
+            .update(cx, |this, _, _| this.editor.clone())
+            .expect("window is open");
+        editor.update(cx, |e, cx| e.set_cursor(LONG_LINE.len(), cx));
+        cx.run_until_parked();
+        assert!(editor.read_with(cx, |e, _| e.scroll_x) > px(0.));
+
+        // Replacing the long line with a short one leaves nothing to scroll, so the
+        // standing offset is clamped away rather than stranding the text off-screen.
+        editor.update(cx, |e, cx| e.set_content("SELECT 1;", cx));
+        cx.run_until_parked();
+        assert_eq!(editor.read_with(cx, |e, _| e.scroll_x), px(0.));
+    }
+
+    #[gpui::test]
+    fn a_sideways_swipe_pans_the_surface(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(crate::theme::Theme::one_dark()));
+        // Enough lines to overflow any test window too, so the vertical axis has
+        // somewhere to go and can be caught stealing the gesture.
+        let content = std::iter::repeat_n(LONG_LINE, 400)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let window = cx.add_window(|_, cx| Harness {
+            editor: cx.new(|cx| CodeEditor::new(cx).with_content(content)),
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let editor = window
+            .update(cx, |this, _, _| this.editor.clone())
+            .expect("window is open");
+        let bounds = editor
+            .read_with(cx, |e, _| e.last_bounds)
+            .expect("the editor has painted");
+        // Over the middle of the first line of text.
+        let over_text = bounds.origin + point(bounds.size.width / 2., px(4.));
+
+        let swipe = |cx: &mut gpui::VisualTestContext, dx: f32| {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: over_text,
+                delta: gpui::ScrollDelta::Pixels(point(px(dx), px(0.))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+        };
+        let offsets = |cx: &mut gpui::VisualTestContext| {
+            editor.read_with(cx, |e, _| (e.scroll_x, e.scroll_handle.offset().y))
+        };
+
+        // Swiping left (negative delta, the platform convention) reveals text to
+        // the right — and leaves the vertical axis alone. A container that scrolls
+        // one axis will happily re-read the other axis' delta as its own, so the
+        // second half of this assertion is the one that catches the code jumping
+        // up and down under a sideways swipe.
+        swipe(cx, -80.);
+        assert_eq!(offsets(cx), (px(80.), px(0.)));
+
+        // …and back the other way, never past column 0.
+        swipe(cx, 200.);
+        assert_eq!(offsets(cx), (px(0.), px(0.)));
+
+        // A vertical swipe is still the container's: it scrolls, the text doesn't
+        // slide sideways.
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: over_text,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-120.))),
+            modifiers: gpui::Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        let (scroll_x, scrolled_y) = offsets(cx);
+        assert_eq!(scroll_x, px(0.));
+        assert!(
+            scrolled_y < px(0.),
+            "a vertical swipe still scrolls the code"
+        );
+
+        // Swiping right from column 0 has nowhere left to go, so the arbiter lets
+        // the tick through to the container — which must not take a sideways delta
+        // as a vertical one and jump the code back up.
+        swipe(cx, 200.);
+        assert_eq!(offsets(cx), (px(0.), scrolled_y));
     }
 }

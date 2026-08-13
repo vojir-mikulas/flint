@@ -11,9 +11,9 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, uniform_list, App, Bounds, ClickEvent, DispatchPhase,
-    ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, MouseMoveEvent, Pixels, Point,
-    Role, ScrollHandle, ScrollWheelEvent, SharedString, Styled, TouchPhase,
+    canvas, div, point, prelude::*, px, uniform_list, AnyElement, App, Bounds, ClickEvent,
+    DispatchPhase, ElementId, ExternalPaths, FocusHandle, IsZero, MouseButton, MouseMoveEvent,
+    Pixels, Point, Role, ScrollHandle, ScrollWheelEvent, SharedString, Styled, TouchPhase,
     UniformListScrollHandle, Window,
 };
 
@@ -226,6 +226,59 @@ fn cell_layout<E: Styled>(el: E, column: &Column, align: ColumnAlign) -> E {
     }
 }
 
+/// How a row's cells are split when columns are frozen: the leading `frozen`
+/// cells stay put, the rest ride a `scroll_w`-wide track shifted by `offset_x`.
+/// `frozen == 0` is the ordinary table, where a row is just its cells.
+#[derive(Clone, Copy)]
+struct Split {
+    frozen: usize,
+    scroll_w: f32,
+    offset_x: Pixels,
+}
+
+impl Split {
+    /// Lay `cells` into `row`: whole when nothing is frozen, otherwise the held
+    /// band followed by the scrolling track, clipped to what is left of the row.
+    fn row<E: ParentElement>(&self, row: E, cells: Vec<AnyElement>) -> E {
+        if self.frozen == 0 {
+            return row.children(cells);
+        }
+        let mut cells = cells;
+        let rest = cells.split_off(self.frozen.min(cells.len()));
+        row.child(
+            div()
+                .flex()
+                .items_center()
+                .h_full()
+                .flex_shrink_0()
+                .children(cells),
+        )
+        .child(
+            // The track is positioned rather than margin-shifted so it keeps its
+            // full width inside a clip box only as wide as the rest of the row;
+            // shifting it left is what "scrolled sideways" means here, since the
+            // rows are not inside a scrolling container in this mode.
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left(self.offset_x)
+                        .h_full()
+                        .w(px(self.scroll_w))
+                        .flex()
+                        .items_center()
+                        .children(rest),
+                ),
+        )
+    }
+}
+
 type IndexHandler = Box<dyn Fn(usize, &mut Window, &mut App) + 'static>;
 /// Begins a column-resize drag: the caller stores the anchor and feeds it back
 /// through [`Table::column_drag`].
@@ -357,6 +410,12 @@ pub struct Table<D: 'static = ()> {
     text_size: Option<Pixels>,
     /// Draw 1px separators between cells and rows (a spreadsheet look).
     grid_lines: bool,
+    /// Rows held between the header and the scrolling list (see
+    /// [`pinned_rows`](Self::pinned_rows)).
+    pinned_rows: Vec<AnyElement>,
+    /// How many leading columns are frozen (see
+    /// [`pinned_columns`](Self::pinned_columns)).
+    pinned_columns: usize,
     /// Accessible name for the grid as a whole, reported on its focusable root
     /// with a `Grid` role. Callers driving a cell cursor update this each frame
     /// to the focused cell's "column: value" so assistive technology speaks the
@@ -410,8 +469,41 @@ impl<D: 'static> Table<D> {
             font_family: None,
             text_size: None,
             grid_lines: false,
+            pinned_rows: Vec::new(),
+            pinned_columns: 0,
             a11y_label: None,
         }
+    }
+
+    /// Freeze the first `n` columns: they hold their place at the left edge while
+    /// the rest of the table scrolls sideways under them.
+    ///
+    /// Only honoured in [`horizontal`](Self::horizontal) mode with a tracked
+    /// horizontal handle ([`track_horizontal_scroll`](Self::track_horizontal_scroll)),
+    /// since freezing is only meaningful when there is a horizontal offset to
+    /// hold against, and the table needs to own that offset to do it: with
+    /// columns frozen the rows are no longer inside one scrolling container, so
+    /// the table drives (and clamps) the handle itself from the wheel.
+    ///
+    /// The caller's own [`pinned_rows`](Self::pinned_rows) are *not* split for
+    /// it — they are opaque elements, so a caller that freezes columns and
+    /// supplies pinned rows must lay those rows out to match.
+    pub fn pinned_columns(mut self, n: usize) -> Self {
+        self.pinned_columns = n;
+        self
+    }
+
+    /// Rows that sit between the header and the scrolling list: they move with
+    /// the columns when the table scrolls horizontally, and never move when it
+    /// scrolls vertically.
+    ///
+    /// The table supplies the slot, not the layout: each element is a whole row,
+    /// built by the caller against the same column widths it declared (the table
+    /// cannot lay these out itself, since they are not addressed by row index and
+    /// carry none of the list's selection or click behaviour).
+    pub fn pinned_rows(mut self, rows: Vec<AnyElement>) -> Self {
+        self.pinned_rows = rows;
+        self
     }
 
     /// Set the grid's accessible name. Drive this with the focused cell's
@@ -797,7 +889,7 @@ fn table_key_nav(
 }
 
 impl<D: 'static> RenderOnce for Table<D> {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = cx.theme();
         let row_height = self.row_height.unwrap_or(theme.row_height);
         let columns = self.columns.clone();
@@ -807,6 +899,34 @@ impl<D: 'static> RenderOnce for Table<D> {
         let line = theme.border_soft;
         let font_family = self.font_family.clone();
         let text_size = self.text_size;
+
+        // Frozen columns split every row into two tracks: the leading cells, laid
+        // out normally, and the rest inside a clipped box translated by the shared
+        // horizontal offset. That is what lets the frozen band hold still while the
+        // rest scrolls, without a second list to keep in vertical step.
+        //
+        // It only engages with a handle to read: the offset *is* the horizontal
+        // scroll position here, since the rows are no longer inside a scrolling
+        // container (see the wheel handler further down, which drives it).
+        let frozen = self.pinned_columns.min(columns.len());
+        let two_track = self.horizontal && frozen > 0 && self.h_scroll_handle.is_some();
+        let frozen = if two_track { frozen } else { 0 };
+        let column_width = |c: &Column| match c.width {
+            ColumnWidth::Fixed(w) => f32::from(w),
+            ColumnWidth::Flex => 160.,
+        };
+        let frozen_w: f32 = columns[..frozen].iter().map(column_width).sum();
+        let scroll_w: f32 = columns[frozen..].iter().map(column_width).sum();
+        let offset_x = self
+            .h_scroll_handle
+            .as_ref()
+            .map(|h| h.offset().x)
+            .unwrap_or(px(0.));
+        let split = Split {
+            frozen,
+            scroll_w,
+            offset_x,
+        };
 
         let on_sort = self.on_sort.clone();
         let on_column_resize_start = self.on_column_resize_start.clone();
@@ -927,17 +1047,19 @@ impl<D: 'static> RenderOnce for Table<D> {
                 .into_any_element()
         });
 
-        let header = div()
-            .id("table-head")
-            .flex()
-            .items_center()
-            .h(gpui::px(28.))
-            .border_b_1()
-            .border_color(theme.border_soft)
-            .text_xs()
-            .when_some(font_family.clone(), |d, f| d.font_family(f))
-            .when_some(text_size, |d, s| d.text_size(s))
-            .children(header_cells);
+        let header = split.row(
+            div()
+                .id("table-head")
+                .flex()
+                .items_center()
+                .h(gpui::px(28.))
+                .border_b_1()
+                .border_color(theme.border_soft)
+                .text_xs()
+                .when_some(font_family.clone(), |d, f| d.font_family(f))
+                .when_some(text_size, |d, s| d.text_size(s)),
+            header_cells.collect(),
+        );
 
         let columns_for_rows = columns.clone();
         let render_row = self.render_row.clone();
@@ -1158,7 +1280,9 @@ impl<D: 'static> RenderOnce for Table<D> {
                                 None => this,
                             }
                         })
-                        .children(laid_out)
+                        .map(|row| {
+                            split.row(row, laid_out.map(IntoElement::into_any_element).collect())
+                        })
                         // An overlay canvas reports the row's painted rect (it has
                         // no hitbox, so it doesn't intercept clicks or drops).
                         .when_some(on_row_bounds.clone(), |this, cb| {
@@ -1185,6 +1309,7 @@ impl<D: 'static> RenderOnce for Table<D> {
 
         // Read out before the two layout branches consume `self`, so the drag
         // overlay can be applied to whichever one is built.
+        let pinned_rows = std::mem::take(&mut self.pinned_rows);
         let column_drag = self.column_drag;
         let on_column_resize = self.on_column_resize.clone();
         let on_column_resize_end = self.on_column_resize_end.clone();
@@ -1201,32 +1326,54 @@ impl<D: 'static> RenderOnce for Table<D> {
                     ColumnWidth::Flex => 160.,
                 })
                 .sum();
-            let mut hscroll = div()
-                .id("table-hscroll")
-                .flex_1()
-                .min_h(gpui::px(0.))
-                .overflow_x_scroll();
-            if let Some(h) = self.h_scroll_handle.as_ref() {
-                hscroll = hscroll.track_scroll(h);
-            }
-            let mut hscroll = hscroll.child(
+            // With columns frozen there is no horizontal scroll container at all:
+            // each row already carries its own clipped, shifted track (see
+            // `Split::row`), and wrapping the lot in one would scroll the frozen
+            // band away with everything else. The wheel handler below owns the
+            // axis instead.
+            let body_content: AnyElement = if two_track {
                 div()
                     .flex()
                     .flex_col()
-                    // Fixed to the columns' combined width so rows + header scroll
-                    // in lockstep — but at least the viewport's width, so when the
-                    // columns are narrower than the pane the rows still fill it.
-                    // Otherwise the blank strip beside the columns sits outside the
-                    // list, and a vertical wheel there lands on the x-only scroll
-                    // container and does nothing.
-                    .w(gpui::px(total))
-                    .min_w(gpui::relative(1.))
-                    .h_full()
+                    .flex_1()
+                    .min_h(gpui::px(0.))
                     .child(header)
-                    .child(list),
-            );
-            // Keep a pure-vertical wheel from being redirected into x-scroll.
-            hscroll.style().restrict_scroll_to_axis = Some(true);
+                    .children(pinned_rows)
+                    .child(list)
+                    .into_any_element()
+            } else {
+                let mut hscroll = div()
+                    .id("table-hscroll")
+                    .flex_1()
+                    .min_h(gpui::px(0.))
+                    .overflow_x_scroll();
+                if let Some(h) = self.h_scroll_handle.as_ref() {
+                    hscroll = hscroll.track_scroll(h);
+                }
+                let mut hscroll = hscroll.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        // Fixed to the columns' combined width so rows + header scroll
+                        // in lockstep — but at least the viewport's width, so when the
+                        // columns are narrower than the pane the rows still fill it.
+                        // Otherwise the blank strip beside the columns sits outside the
+                        // list, and a vertical wheel there lands on the x-only scroll
+                        // container and does nothing.
+                        .w(gpui::px(total))
+                        .min_w(gpui::relative(1.))
+                        .h_full()
+                        .child(header)
+                        // Inside the horizontal track, so pinned rows stay under the
+                        // header cells they belong to as the table scrolls sideways;
+                        // outside the list, so vertical scrolling leaves them put.
+                        .children(pinned_rows)
+                        .child(list),
+                );
+                // Keep a pure-vertical wheel from being redirected into x-scroll.
+                hscroll.style().restrict_scroll_to_axis = Some(true);
+                hscroll.into_any_element()
+            };
 
             let table_id = self.id.clone();
             let mut root = div()
@@ -1245,8 +1392,20 @@ impl<D: 'static> RenderOnce for Table<D> {
             // axis per scroll event, drives only that handle, and swallows the
             // event — so every mixed-axis swipe is locked to one axis and the grid
             // can't drift diagonally.
-            if let (Some(h), Some(v)) = (self.h_scroll_handle.clone(), self.scroll_handle.clone()) {
-                let v = v.0.borrow().base_handle.clone();
+            //
+            // With columns frozen the same overlay does more: there is no
+            // horizontal container left, so it *is* the horizontal scroll, and it
+            // clamps the offset itself against the scrolling track's extent (the
+            // frozen band never scrolls, so it is not part of that extent).
+            let vertical_handle = self
+                .scroll_handle
+                .clone()
+                .map(|v| v.0.borrow().base_handle.clone());
+            let wheel_handle = self
+                .h_scroll_handle
+                .clone()
+                .filter(|_| two_track || vertical_handle.is_some());
+            if let Some(h) = wheel_handle {
                 let axis_lock = axis_lock_for(&table_id);
                 root = root.relative().child(
                     canvas(
@@ -1255,6 +1414,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                             let view = window.current_view();
                             let line_height = window.line_height();
                             let axis_lock = axis_lock.clone();
+                            let v = vertical_handle.clone();
                             window.on_mouse_event(
                                 move |event: &ScrollWheelEvent, phase, _window, cx| {
                                     if phase != DispatchPhase::Capture
@@ -1271,11 +1431,44 @@ impl<D: 'static> RenderOnce for Table<D> {
                                     }
                                     let delta = event.delta.pixel_delta(line_height);
                                     let (ax, ay) = (delta.x.abs(), delta.y.abs());
+                                    if two_track {
+                                        // Vertical is still the list's own: only
+                                        // sideways movement is ours, so a plain
+                                        // wheel keeps falling through untouched.
+                                        let sideways = match (ax.is_zero(), ay.is_zero()) {
+                                            (true, _) => false,
+                                            (false, true) => true,
+                                            (false, false) => {
+                                                let mut locked = axis_lock.get();
+                                                let sideways = *locked.get_or_insert(ax > ay);
+                                                axis_lock.set(locked);
+                                                sideways
+                                            }
+                                        };
+                                        if !sideways {
+                                            return;
+                                        }
+                                        // Clamp here: without a scroll container
+                                        // nothing else bounds the offset, and an
+                                        // unbounded one scrolls the columns off
+                                        // into empty space with no way back.
+                                        let viewport = f32::from(bounds.size.width) - frozen_w;
+                                        let max = (scroll_w - viewport).max(0.);
+                                        let x =
+                                            f32::from(h.offset().x + delta.x).clamp(-max, 0.);
+                                        h.set_offset(point(px(x), gpui::px(0.)));
+                                        cx.stop_propagation();
+                                        cx.notify(view);
+                                        return;
+                                    }
                                     // A clean single-axis wheel falls through to
                                     // the native handlers untouched.
                                     if ax.is_zero() || ay.is_zero() {
                                         return;
                                     }
+                                    let Some(v) = v.as_ref() else {
+                                        return;
+                                    };
                                     // A mixed-axis tick swallows the event and
                                     // moves whichever axis this *gesture* has
                                     // locked to. The first ambiguous tick decides
@@ -1303,7 +1496,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                 );
             }
 
-            let root = root.child(hscroll);
+            let root = root.child(body_content);
             root.when_some(focus_handle.clone(), |d, handle| {
                 let d = d.track_focus(&handle).key_context("Table");
                 match on_nav.clone() {
@@ -1321,6 +1514,7 @@ impl<D: 'static> RenderOnce for Table<D> {
                 .flex_col()
                 .size_full()
                 .child(header)
+                .children(pinned_rows)
                 .child(list)
                 .when_some(focus_handle.clone(), |d, handle| {
                     let d = d.track_focus(&handle).key_context("Table");

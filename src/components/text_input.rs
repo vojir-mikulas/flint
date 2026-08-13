@@ -648,12 +648,13 @@ impl TextInput {
         else {
             return 0;
         };
-        if position.y < bounds.top() {
-            return 0;
-        }
-        if position.y > bounds.bottom() {
-            return self.content.len();
-        }
+        // Horizontal only: one line leaves `y` nothing to choose between, so the
+        // pointer's row is never in question. `last_bounds` is the *shaped line*,
+        // which is shorter than the field that hosts it (a 32px field around a
+        // ~21px line; a grid cell around the same). Snapping to 0 above it and to
+        // the end below it therefore turned those padding bands into dead zones
+        // that threw the caret to an end on click, and collapsed a drag-selection
+        // the moment the pointer strayed a pixel off the glyphs.
         line.closest_index_for_x(
             position.x - bounds.left() - self.align_offset + self.scroll_offset,
         )

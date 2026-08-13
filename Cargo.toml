@@ -47,6 +47,9 @@ gpui = { workspace = true, features = ["font-kit"] }
 [dev-dependencies]
 gpui_platform.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+# `#[gpui::test]`: behaviour that only exists once a component is laid out and
+# painted (scroll offsets, hit-testing) is tested against a real test window.
+gpui = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui_platform = { workspace = true, features = ["font-kit"] }

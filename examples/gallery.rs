@@ -16,7 +16,7 @@ use std::time::Duration;
 use flint::prelude::*;
 use gpui::{
     div, prelude::*, px, App, Axis, Bounds, Context, Entity, MouseButton, Pixels, Point,
-    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    ScrollHandle, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform::application;
 
@@ -103,6 +103,9 @@ struct Gallery {
     stream_source_ix: usize,
     stream_buffer: Rc<RefCell<WindowBuffer>>,
     stream_scroll: UniformListScrollHandle,
+    /// The streaming grid's horizontal offset: it runs in `horizontal` mode with
+    /// a frozen row-number column, which the table drives through this handle.
+    stream_h_scroll: ScrollHandle,
     stream_scrollbar: ScrollbarState,
     synthetic: Rc<SyntheticSource>,
     /// Built lazily once the background-generated DB is ready.
@@ -529,6 +532,7 @@ impl Gallery {
             stream_source_ix: 0,
             stream_buffer: Rc::new(RefCell::new(WindowBuffer::default())),
             stream_scroll: UniformListScrollHandle::new(),
+            stream_h_scroll: ScrollHandle::new(),
             stream_scrollbar: ScrollbarState::new(),
             synthetic: Rc::new(SyntheticSource::default()),
             sqlite: None,
@@ -1439,6 +1443,84 @@ impl Gallery {
             })
     }
 
+    /// A table with **pinned rows**: rows held between the header and the list,
+    /// so they stay on screen while the list scrolls under them. The table owns
+    /// the slot; the caller builds each row against the widths it declared, which
+    /// is what lets a pinned row carry its own affordances (here an unpin ✕).
+    fn pinned_table(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, faint, accent, line) = (
+            theme.text_muted,
+            theme.text_faint,
+            theme.accent,
+            theme.border_soft,
+        );
+        // The same widths the columns below declare, so a pinned row's cells sit
+        // under the header cells they belong to.
+        let widths = [gpui::px(200.), gpui::px(90.)];
+        let pinned: Vec<gpui::AnyElement> = [0usize, 4]
+            .into_iter()
+            .map(|ix| {
+                let (name, size, _) = ROWS[ix];
+                div()
+                    .flex()
+                    .items_center()
+                    .h(theme.row_height)
+                    .bg(theme.bg_selected)
+                    .border_b_1()
+                    .border_color(line)
+                    .child(
+                        div()
+                            .w(widths[0])
+                            .flex_shrink_0()
+                            .px_2p5()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_color(accent)
+                            .child("📌")
+                            .child(div().text_color(muted).child(name)),
+                    )
+                    .child(
+                        div()
+                            .w(widths[1])
+                            .flex_shrink_0()
+                            .px_2p5()
+                            .flex()
+                            .justify_end()
+                            .text_color(faint)
+                            .child(size),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .h(gpui::px(180.))
+            .w_full()
+            .panel(cx)
+            .rounded(theme.radius)
+            .overflow_hidden()
+            .child(
+                Table::<()>::new(
+                    "pinned-files",
+                    vec![
+                        Column::new("Name").width(widths[0]),
+                        Column::new("Size").width(widths[1]).align_end(),
+                    ],
+                )
+                .row_count(ROWS.len() * 4)
+                .pinned_rows(pinned)
+                .render_row(move |ix, _window, _cx| {
+                    let (name, size, _) = ROWS[ix % ROWS.len()];
+                    vec![
+                        div().text_color(muted).child(name).into_any_element(),
+                        div().text_color(faint).child(size).into_any_element(),
+                    ]
+                }),
+            )
+    }
+
     /// An **in-app drag** table: drag any row onto a folder row to move it in
     /// (the item then disappears from the top level). Exercises `Table`'s
     /// `on_row_drag` (payload), `drag_preview` (cursor chip) and
@@ -1568,14 +1650,16 @@ impl Gallery {
             bool_false: theme.red,
         };
 
-        // A row-number gutter column + one column per source column.
+        // A row-number gutter column + one column per source column. Fixed widths
+        // throughout: the grid runs in `horizontal` mode, where the columns keep
+        // their width and the table scrolls sideways instead of squeezing them.
         let mut columns = vec![Column::new("#").width(px(64.)).align_end()];
         for spec in &specs {
             let c = Column::new(spec.name.clone());
             columns.push(if spec.numeric {
                 c.width(px(120.)).align_end()
             } else {
-                c.flex()
+                c.width(px(200.))
             });
         }
         let ncols = specs.len();
@@ -1588,6 +1672,12 @@ impl Gallery {
             .row_count(total)
             .row_height(px(25.))
             .track_scroll(&self.stream_scroll)
+            .track_horizontal_scroll(&self.stream_h_scroll)
+            .horizontal(true)
+            // The row-number column holds the left edge while the data columns
+            // scroll under it: an ordinal that scrolls away with its row leaves
+            // the grid with no fixed reference at all.
+            .pinned_columns(1)
             // Fill the window around the viewport *before* the rows render.
             .on_visible_range(move |range, _window, _cx| {
                 buf_for_range.borrow_mut().ensure(&*src_for_range, range);
@@ -1952,6 +2042,7 @@ impl Render for Gallery {
         let tree = self.tree(cx);
         let table = self.table(cx);
         let secondary_table = self.secondary_table(cx);
+        let pinned_table = self.pinned_table(cx);
         let drag_table = self.drag_table(cx);
         let streaming_grid = self.streaming_grid(cx);
         let sql_editor = self.sql_editor(cx);
@@ -2045,6 +2136,7 @@ impl Render for Gallery {
             .child(self.section("Tree (virtualized, disclosure)", tree, cx))
             .child(self.section("Table", table, cx))
             .child(self.section("Table - right-click menu", secondary_table, cx))
+            .child(self.section("Table - pinned rows", pinned_table, cx))
             .child(self.section("Table - in-app drag to folder", drag_table, cx))
             .child(self.section(
                 "M0 spike A - streaming grid (bounded window + cancel)",
